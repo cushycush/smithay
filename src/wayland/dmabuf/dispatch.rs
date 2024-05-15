@@ -75,6 +75,7 @@ where
                         formats: self.formats.clone(),
                         modifier: Mutex::new(None),
                         planes: Mutex::new(Vec::with_capacity(MAX_PLANES)),
+                        node: Mutex::new(None),
                     },
                 );
             }
@@ -288,6 +289,10 @@ where
                 }
             }
 
+            zwp_linux_buffer_params_v1::Request::SetSamplingDevice { device } => {
+                *self.node.lock().unwrap() = device[0..8].try_into().ok().map(u64::from_ne_bytes);
+            }
+
             zwp_linux_buffer_params_v1::Request::Create {
                 width,
                 height,
@@ -295,7 +300,9 @@ where
                 flags,
             } => {
                 // create_dmabuf performs an implicit ensure_unused function call.
-                if let Some(dmabuf) = self.create_dmabuf(params, width, height, format, flags, None) {
+                if let Some(dmabuf) =
+                    self.create_dmabuf(params, width, height, format, flags, *self.node.lock().unwrap())
+                {
                     if state.dmabuf_state().globals.contains_key(&self.id) {
                         let notifier = ImportNotifier::new(
                             params.clone(),
@@ -320,7 +327,9 @@ where
             } => {
                 // Client is killed if the if statement is not taken.
                 // create_dmabuf performs an implicit ensure_unused function call.
-                if let Some(dmabuf) = self.create_dmabuf(params, width, height, format, flags, None) {
+                if let Some(dmabuf) =
+                    self.create_dmabuf(params, width, height, format, flags, *self.node.lock().unwrap())
+                {
                     if state.dmabuf_state().globals.contains_key(&self.id) {
                         // The buffer isn't technically valid during data_init, but the client is not allowed to use the buffer until ready.
                         let buffer = data_init.init(buffer_id, dmabuf.clone());

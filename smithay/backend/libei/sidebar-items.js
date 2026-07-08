@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EiInputEvent","ScrollEvent"],"struct":["EiInput","EiInputConnection","EiInputSeat"]};

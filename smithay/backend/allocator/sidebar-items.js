@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Fourcc","Modifier","Vendor"],"mod":["dmabuf","dumb","format","gbm","udmabuf","vulkan"],"struct":["Format","Slot","Swapchain","UnrecognizedFourcc","UnrecognizedVendor"],"trait":["Allocator","Buffer"]};

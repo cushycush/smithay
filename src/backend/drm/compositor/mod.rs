@@ -178,7 +178,7 @@ use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
-    surface::VrrSupport,
+    surface::{PresentationMode, VrrSupport},
 };
 
 mod elements;
@@ -750,11 +750,13 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
-    ) -> Result<(), crate::backend::drm::error::Error> {
+        async_flip: bool,
+    ) -> Result<PresentationMode, crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            async_flip,
         )
     }
 
@@ -944,6 +946,9 @@ impl From<&PlaneInfo> for PlaneAssignment {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    /// The mode this frame's flip actually ran in (async vs the vsync fallback), stamped at
+    /// submit time and read back once the flip completes (DRIFT-984).
+    presentation_mode: PresentationMode,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -1063,6 +1068,8 @@ where
     supports_fencing: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
+    /// Requested pacing for the next flip (sticky, DRIFT-984). Consulted in [`Self::submit`].
+    presentation_mode: PresentationMode,
 
     framebuffer_exporter: F,
 
@@ -1083,6 +1090,59 @@ where
 
     debug_flags: DebugFlags,
     span: tracing::Span,
+}
+
+/// Tearing-control accessors (DRIFT-984). These are plain field/surface reads that do not need
+/// the allocator/exporter bounds of the main `impl`, so they live in a minimal block that the
+/// equally-light [`DrmOutput`](super::DrmOutput) passthroughs can call.
+impl<A, F, U, G> DrmCompositor<A, F, U, G>
+where
+    A: Allocator,
+    F: ExportFramebuffer<A::Buffer>,
+    <F as ExportFramebuffer<A::Buffer>>::Framebuffer: std::fmt::Debug + Send + Sync + 'static,
+    G: AsFd + 'static,
+{
+    /// Whether the driver supports async (tearing) page flips for the underlying surface.
+    ///
+    /// [`set_presentation_mode`](DrmCompositor::set_presentation_mode) with
+    /// [`PresentationMode::Async`] only tears when this is `true`; otherwise it degrades to
+    /// vsync.
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.surface.supports_async_page_flip()
+    }
+
+    /// The pacing requested for the next flip. See
+    /// [`set_presentation_mode`](DrmCompositor::set_presentation_mode).
+    pub fn presentation_mode(&self) -> PresentationMode {
+        self.presentation_mode
+    }
+
+    /// Requests a pacing mode for subsequent flips (sticky until changed).
+    ///
+    /// [`PresentationMode::Async`] asks for tearing (immediate) page flips. It only takes effect
+    /// on a plain page flip (never a modeset commit) and only when the driver supports async
+    /// flips; a frame that cannot fly async silently runs vsynced instead. Read
+    /// [`pending_presentation_mode`](DrmCompositor::pending_presentation_mode) in the vblank
+    /// handler BEFORE [`frame_submitted`](DrmCompositor::frame_submitted) for what the completing
+    /// flip actually did.
+    pub fn set_presentation_mode(&mut self, mode: PresentationMode) {
+        self.presentation_mode = mode;
+    }
+
+    /// The mode the currently pending (in-flight) flip actually ran in, i.e. the frame that the
+    /// next [`frame_submitted`](DrmCompositor::frame_submitted) will acknowledge.
+    ///
+    /// Read this in the vblank handler BEFORE calling `frame_submitted` to classify the flip that
+    /// just completed by what really happened (a frame that requested async but fell back reports
+    /// [`PresentationMode::Vsync`]), so pacing and presentation-feedback key off the real outcome
+    /// rather than the current requested intent, which may have changed since the flip was queued.
+    /// Returns [`PresentationMode::Vsync`] when no flip is pending.
+    pub fn pending_presentation_mode(&self) -> PresentationMode {
+        self.pending_frame
+            .as_ref()
+            .map(|frame| frame.presentation_mode)
+            .unwrap_or(PresentationMode::Vsync)
+    }
 }
 
 impl<A, F, U, G> DrmCompositor<A, F, U, G>
@@ -1249,6 +1309,7 @@ where
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
                         signaled_fence,
+                        presentation_mode: PresentationMode::Vsync,
                         current_frame,
                         pending_frame: None,
                         queued_frame: None,
@@ -1431,6 +1492,7 @@ where
             primary_is_opaque: is_opaque,
             reset_pending: true,
             signaled_fence,
+            presentation_mode: PresentationMode::Vsync,
             current_frame,
             pending_frame: None,
             queued_frame: None,
@@ -2545,14 +2607,32 @@ where
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
-        let flip = if self.surface.commit_pending() {
-            prepared_frame
-                .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+        // Only a plain page flip can tear; a modeset commit is always vsync (DRIFT-984). The async
+        // request is the ordinary request plus PAGE_FLIP_ASYNC: IN_FENCE_FD and FB_DAMAGE_CLIPS are
+        // kept, since recent kernels exempt both from the async-flip property check, and keeping the
+        // fence means the kernel still waits for the buffer to be ready (no scanout of an unfinished
+        // buffer, and the needs_sync() contract stays consistent). A kernel that refuses the async
+        // commit falls back to a synchronous flip of the same request inside page_flip.
+        let want_async = self.presentation_mode == PresentationMode::Async;
+
+        let (flip, presentation_mode) = if self.surface.commit_pending() {
+            (
+                prepared_frame
+                    .frame
+                    .commit(&self.surface, self.supports_fencing, allow_partial_update, true),
+                PresentationMode::Vsync,
+            )
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            match prepared_frame.frame.page_flip(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                true,
+                want_async,
+            ) {
+                Ok(mode) => (Ok(()), mode),
+                Err(err) => (Err(err), PresentationMode::Vsync),
+            }
         };
 
         let res = self.handle_flip(&prepared_frame, flip);
@@ -2561,6 +2641,7 @@ where
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
+                presentation_mode,
             });
         }
 
@@ -2616,7 +2697,12 @@ where
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
+        if let Some(PendingFrame {
+            mut frame,
+            user_data,
+            presentation_mode: _,
+        }) = self.pending_frame.take()
+        {
             std::mem::swap(&mut frame, &mut self.current_frame);
             if self.queued_frame.is_some() {
                 self.submit()?;

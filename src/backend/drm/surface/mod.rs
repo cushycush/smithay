@@ -170,6 +170,22 @@ pub enum VrrSupport {
     Supported,
 }
 
+/// How a page flip should be paced against the display refresh.
+///
+/// [`PresentationMode::Async`] requests an immediate (tearing) page flip via the kernel's
+/// async flip path (`DRM_MODE_PAGE_FLIP_ASYNC`). It only takes effect on a flip (not a
+/// modeset commit) and only when the driver advertises the matching async-flip capability;
+/// otherwise it degrades to [`PresentationMode::Vsync`]. This is the Drift tearing-control
+/// patch (DRIFT-984) carried on top of the pinned rev until upstream lands async flips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresentationMode {
+    /// Flip synchronized to vblank (the normal, tear-free path).
+    #[default]
+    Vsync,
+    /// Flip as soon as the kernel accepts it, allowing the scanout to tear.
+    Async,
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum DrmSurfaceInternal {
@@ -426,18 +442,34 @@ impl DrmSurface {
     ///
     /// This operation is not blocking and will produce a `vblank` event once swapping is done.
     /// Make sure to have the device registered in your event loop to not miss the event.
+    ///
+    /// When `async_flip` is set and the driver supports async page flips
+    /// (see [`DrmSurface::supports_async_page_flip`]), the flip is submitted on the kernel's
+    /// tearing path. The returned [`PresentationMode`] reports what actually happened: a frame
+    /// that could not be flown async (missing capability, or a kernel rejection that fell back
+    /// to a synchronous retry) comes back as [`PresentationMode::Vsync`].
     #[profiling::function]
     pub fn page_flip<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
-    ) -> Result<(), Error> {
+        async_flip: bool,
+    ) -> Result<PresentationMode, Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event, async_flip),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
-                surf.page_flip(fb, event)
+                surf.page_flip(fb, event, async_flip)
             }
+        }
+    }
+
+    /// Whether the driver advertises support for async (tearing) page flips for this surface's
+    /// API (atomic vs legacy). Queried once at surface creation and cached.
+    pub fn supports_async_page_flip(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.supports_async_page_flip(),
+            DrmSurfaceInternal::Legacy(surf) => surf.supports_async_page_flip(),
         }
     }
 

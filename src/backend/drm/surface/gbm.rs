@@ -398,7 +398,8 @@ where
         let flip = if self.drm.commit_pending() {
             self.drm.commit([plane_state], true)
         } else {
-            self.drm.page_flip([plane_state], true)
+            // GbmBufferedSurface never tears; always a vsync flip (DRIFT-984).
+            self.drm.page_flip([plane_state], true, false).map(|_| ())
         };
         if flip.is_ok() {
             self.pending_fb = Some((slot, user_data));

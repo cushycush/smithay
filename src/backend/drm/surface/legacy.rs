@@ -1,4 +1,7 @@
 use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, connector, crtc, encoder, framebuffer};
+use drm::{Device as BasicDevice, DriverCapability};
+
+use super::PresentationMode;
 
 use std::collections::HashSet;
 use std::sync::{
@@ -14,7 +17,7 @@ use crate::{
     utils::DevPath,
 };
 
-use tracing::{debug, info, info_span, instrument, trace};
+use tracing::{debug, info, info_span, instrument, trace, warn};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct State {
@@ -87,6 +90,11 @@ pub struct LegacyDrmSurface {
     state: RwLock<State>,
     pending: RwLock<State>,
     dpms: Mutex<bool>,
+    /// Whether the driver advertises `DRM_CAP_ASYNC_PAGE_FLIP` (legacy async flips). Queried
+    /// once at construction (DRIFT-984).
+    supports_async_page_flip: bool,
+    /// Latches after the first async->vsync degrade so it is logged once, not every frame.
+    async_flip_degraded_logged: AtomicBool,
     pub(super) span: tracing::Span,
 }
 
@@ -108,6 +116,11 @@ impl LegacyDrmSurface {
             connectors: connectors.iter().copied().collect(),
         };
 
+        let supports_async_page_flip = fd
+            .get_driver_capability(DriverCapability::ASyncPageFlip)
+            .map(|val| val != 0)
+            .unwrap_or(false);
+
         drop(_guard);
         let surface = LegacyDrmSurface {
             fd,
@@ -116,10 +129,17 @@ impl LegacyDrmSurface {
             state: RwLock::new(state),
             pending: RwLock::new(pending),
             dpms: Mutex::new(true),
+            supports_async_page_flip,
+            async_flip_degraded_logged: AtomicBool::new(false),
             span,
         };
 
         Ok(surface)
+    }
+
+    /// Whether the driver advertises async (tearing) legacy page flips, cached at construction.
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.supports_async_page_flip
     }
 
     pub fn current_connectors(&self) -> HashSet<connector::Handle> {
@@ -333,7 +353,12 @@ impl LegacyDrmSurface {
 
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
-    pub fn page_flip(&self, framebuffer: framebuffer::Handle, event: bool) -> Result<(), Error> {
+    pub fn page_flip(
+        &self,
+        framebuffer: framebuffer::Handle,
+        event: bool,
+        async_flip: bool,
+    ) -> Result<PresentationMode, Error> {
         trace!("Queueing Page flip");
 
         if !self.active.load(Ordering::SeqCst) {
@@ -347,18 +372,39 @@ impl LegacyDrmSurface {
             *dpms = true;
         }
 
-        ControlDevice::page_flip(
-            &*self.fd,
-            self.crtc,
-            framebuffer,
-            if event {
-                PageFlipFlags::EVENT
+        let want_async = async_flip && self.supports_async_page_flip;
+        if async_flip && !want_async && !self.async_flip_degraded_logged.swap(true, Ordering::Relaxed) {
+            debug!("async page flip requested but DRM_CAP_ASYNC_PAGE_FLIP is unavailable; using vsync");
+        }
+
+        let base_flags = if event {
+            PageFlipFlags::EVENT
+        } else {
+            PageFlipFlags::empty()
+        };
+        let flags = if want_async {
+            base_flags | PageFlipFlags::ASYNC
+        } else {
+            base_flags
+        };
+
+        let mut outcome = if want_async {
+            PresentationMode::Async
+        } else {
+            PresentationMode::Vsync
+        };
+        let mut res = ControlDevice::page_flip(&*self.fd, self.crtc, framebuffer, flags, None);
+        if res.is_err() && want_async {
+            if !self.async_flip_degraded_logged.swap(true, Ordering::Relaxed) {
+                warn!("async page flip rejected by the kernel, falling back to vsync for this frame");
             } else {
-                PageFlipFlags::empty()
-            },
-            None,
-        )
-        .map_err(|source| {
+                trace!("async page flip rejected, vsync fallback");
+            }
+            outcome = PresentationMode::Vsync;
+            res = ControlDevice::page_flip(&*self.fd, self.crtc, framebuffer, base_flags, None);
+        }
+
+        res.map(|()| outcome).map_err(|source| {
             Error::Access(AccessError {
                 errmsg: "Failed to page flip",
                 dev: self.fd.dev_path(),

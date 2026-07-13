@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    DrmDevice, DrmError, Planes,
+    DrmDevice, DrmError, Planes, PresentationMode,
     compositor::{
         DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
         RenderFrameErrorType, RenderFrameResult,
@@ -787,6 +787,29 @@ where
     /// Returns the underlying [`crtc`] of this surface
     pub fn crtc(&self) -> crtc::Handle {
         self.crtc
+    }
+
+    /// Whether the driver supports async (tearing) page flips for this output (DRIFT-984).
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.with_compositor(|compositor| compositor.supports_async_page_flip())
+    }
+
+    /// Requests a pacing mode for subsequent flips (sticky until changed). See
+    /// [`DrmCompositor::set_presentation_mode`].
+    pub fn set_presentation_mode(&self, mode: PresentationMode) {
+        self.with_compositor(|compositor| compositor.set_presentation_mode(mode));
+    }
+
+    /// The pacing requested for the next flip.
+    pub fn presentation_mode(&self) -> PresentationMode {
+        self.with_compositor(|compositor| compositor.presentation_mode())
+    }
+
+    /// The mode the currently pending (in-flight) flip ran in, i.e. the frame the next
+    /// [`DrmOutput::frame_submitted`] will acknowledge. Read it BEFORE `frame_submitted` to
+    /// classify the completing flip by what really happened (DRIFT-984).
+    pub fn pending_presentation_mode(&self) -> PresentationMode {
+        self.with_compositor(|compositor| compositor.pending_presentation_mode())
     }
 
     /// Provides exclusive access to the underlying [`DrmCompositor`]

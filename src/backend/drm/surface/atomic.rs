@@ -1,5 +1,6 @@
 use drm::control::Device as ControlDevice;
 use drm::control::atomic::AtomicModeReq;
+use drm::{Device as BasicDevice, DriverCapability};
 use drm::control::connector::Interface;
 use drm::control::property::ValueType;
 use drm::control::{
@@ -35,7 +36,7 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
-use super::{PlaneConfig, PlaneState, VrrSupport};
+use super::{PlaneConfig, PlaneState, PresentationMode, VrrSupport};
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -172,6 +173,14 @@ pub struct AtomicDrmSurface {
     prop_mapping: Arc<RwLock<PropMapping>>,
     state: RwLock<State>,
     pending: RwLock<State>,
+    /// Whether the driver advertises `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`. Queried once at
+    /// construction; an async page flip requested without it silently degrades to vsync
+    /// (DRIFT-984).
+    supports_async_page_flip: bool,
+    /// Latches after the first time an async flip degraded to vsync (missing capability or a
+    /// kernel rejection that fell back to a synchronous retry), so the degrade is logged once
+    /// instead of every frame at hundreds of fps.
+    async_flip_degraded_logged: AtomicBool,
     pub(super) span: tracing::Span,
 }
 
@@ -209,6 +218,13 @@ impl AtomicDrmSurface {
             connectors: connectors.iter().copied().collect(),
         };
 
+        // Query the async-flip capability once. A driver that lacks it means every async
+        // page-flip request quietly behaves as vsync rather than erroring per frame.
+        let supports_async_page_flip = fd
+            .get_driver_capability(DriverCapability::AtomicASyncPageFlip)
+            .map(|val| val != 0)
+            .unwrap_or(false);
+
         drop(_guard);
         let surface = AtomicDrmSurface {
             fd,
@@ -219,6 +235,8 @@ impl AtomicDrmSurface {
             prop_mapping,
             state: RwLock::new(state),
             pending: RwLock::new(pending),
+            supports_async_page_flip,
+            async_flip_degraded_logged: AtomicBool::new(false),
             span,
         };
 
@@ -863,15 +881,28 @@ impl AtomicDrmSurface {
         result
     }
 
+    /// Whether the driver advertises async (tearing) atomic page flips, cached at construction.
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.supports_async_page_flip
+    }
+
     #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
     #[profiling::function]
     pub fn page_flip<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
-    ) -> Result<(), Error> {
+        async_flip: bool,
+    ) -> Result<PresentationMode, Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
+        }
+
+        // Only fly async if the caller asked for it AND the driver supports it. Without the
+        // capability the request degrades to a normal vsync flip rather than erroring.
+        let want_async = async_flip && self.supports_async_page_flip;
+        if async_flip && !want_async && !self.async_flip_degraded_logged.swap(true, Ordering::Relaxed) {
+            debug!("async page flip requested but DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP is unavailable; using vsync");
         }
 
         let mut used_planes = self.used_planes.lock().unwrap();
@@ -892,36 +923,63 @@ impl AtomicDrmSurface {
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
         // indicating a problem in our assumptions.
-        trace!(?planes, "Queueing page flip: {:?}", req);
-        let res = self
-            .fd
-            .atomic_commit(
-                if event {
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
-                } else {
-                    AtomicCommitFlags::NONBLOCK
-                },
-                req.build()?,
-            )
-            .map_err(|source| {
-                Error::Access(AccessError {
-                    errmsg: "Page flip commit failed",
-                    dev: self.fd.dev_path(),
-                    source,
-                })
-            });
+        let base_flags = if event {
+            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
+        } else {
+            AtomicCommitFlags::NONBLOCK
+        };
+        // The built request is reused verbatim for the synchronous fallback, so build it once.
+        let built = req.build()?;
+        trace!(?planes, async_flip = want_async, "Queueing page flip: {:?}", req);
 
-        if res.is_ok() {
-            for plane in planes.iter() {
-                if plane.config.is_some() {
-                    used_planes.insert(plane.handle);
+        let mut outcome = if want_async {
+            PresentationMode::Async
+        } else {
+            PresentationMode::Vsync
+        };
+
+        // The vsync path commits the built request by move (no fallback, so no clone). The async
+        // path keeps a copy so a kernel rejection can be retried synchronously with the same
+        // request; that retry is a genuine vsync flip, so the reported outcome flips to Vsync.
+        let res = if want_async {
+            let mut r = self
+                .fd
+                .atomic_commit(base_flags | AtomicCommitFlags::PAGE_FLIP_ASYNC, built.clone());
+            if r.is_err() {
+                if !self.async_flip_degraded_logged.swap(true, Ordering::Relaxed) {
+                    warn!("async page flip rejected by the kernel, falling back to vsync for this frame");
                 } else {
-                    used_planes.remove(&plane.handle);
+                    trace!("async page flip rejected, vsync fallback");
                 }
+                outcome = PresentationMode::Vsync;
+                r = self.fd.atomic_commit(base_flags, built);
             }
-        }
+            r
+        } else {
+            self.fd.atomic_commit(base_flags, built)
+        };
 
-        res
+        let res = res.map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Page flip commit failed",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        });
+
+        match res {
+            Ok(()) => {
+                for plane in planes.iter() {
+                    if plane.config.is_some() {
+                        used_planes.insert(plane.handle);
+                    } else {
+                        used_planes.remove(&plane.handle);
+                    }
+                }
+                Ok(outcome)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     // this helper function disconnects the plane.

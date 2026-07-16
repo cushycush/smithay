@@ -162,6 +162,14 @@ impl Clone for OutputUserData {
     }
 }
 
+/// The scale to advertise on a `wl_output` for a client running at `client_scale`.
+///
+/// Both the bind path and `wl_change_current_state` send through this, so an
+/// instance's `last_client_scale` always records the scale it was actually sent at.
+pub(super) fn scale_for_client(integer_scale: i32, client_scale: f64) -> i32 {
+    (integer_scale as f64 / client_scale).max(1.).ceil() as i32
+}
+
 impl Inner {
     fn send_geometry_to(&self, output: &WlOutput) {
         output.geometry(
@@ -250,8 +258,7 @@ impl Output {
                 inner.send_geometry_to(&output);
             }
             if (new_scale.is_some() || scale_changed) && output.version() >= 2 {
-                let scale = (inner.scale.integer_scale() as f64 / client_scale).max(1.).ceil() as i32;
-                output.scale(scale);
+                output.scale(scale_for_client(inner.scale.integer_scale(), client_scale));
             }
             if output.version() >= 2 {
                 output.done();

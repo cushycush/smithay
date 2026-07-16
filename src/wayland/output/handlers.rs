@@ -13,7 +13,7 @@ use wayland_server::{
 
 use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2, compositor::CompositorHandler};
 
-use super::{Output, OutputHandler, OutputUserData, WlOutputData, xdg::XdgOutput};
+use super::{Output, OutputHandler, OutputUserData, WlOutputData, scale_for_client, xdg::XdgOutput};
 
 /*
  * Wl Output
@@ -34,17 +34,28 @@ where
         resource: New<WlOutput>,
         data_init: &mut DataInit<'_, D>,
     ) {
+        // Grab the client-scale handle before locking the output: client_compositor_state is
+        // downstream code, and calling it under our mutex would let a compositor that touches this
+        // Output from it deadlock every bind.
         let client_scale = state.client_compositor_state(client).clone_client_scale();
+
+        let mut inner = self.output.inner.0.lock().unwrap();
+
+        // But read it under the lock. wl_change_current_state takes this same lock before it walks
+        // instances, so a set_client_scale racing this bind is now ordered against the push below:
+        // either its re-advertise runs first and this load sees the new scale, or it waits and finds
+        // this instance already pushed. Loading before the lock instead leaves the window where the
+        // re-advertise walks instances we are not in yet, and since our seed would match the stale
+        // value we sent, nothing would ever re-correct this instance.
+        let current_client_scale = client_scale.load(Ordering::Acquire);
         let output = data_init.init(
             resource,
             OutputUserData {
                 output: self.output.downgrade(),
-                last_client_scale: AtomicF64::new(client_scale.load(Ordering::Acquire)),
+                last_client_scale: AtomicF64::new(current_client_scale),
                 client_scale,
             },
         );
-
-        let mut inner = self.output.inner.0.lock().unwrap();
 
         let span = warn_span!("output_bind", name = inner.name);
         let _enter = span.enter();
@@ -80,7 +91,7 @@ where
         }
 
         if output.version() >= 2 {
-            output.scale(inner.scale.integer_scale());
+            output.scale(scale_for_client(inner.scale.integer_scale(), current_client_scale));
             output.done();
         }
 

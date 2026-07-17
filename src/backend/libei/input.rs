@@ -44,7 +44,7 @@ impl InputBackend for EiInput {
     type TouchUpEvent = request::TouchUp;
     type TouchMotionEvent = request::TouchMotion;
     type TouchCancelEvent = request::TouchCancel;
-    type TouchFrameEvent = input::UnusedEvent;
+    type TouchFrameEvent = request::Frame;
 
     type TabletToolAxisEvent = input::UnusedEvent;
     type TabletToolProximityEvent = input::UnusedEvent;
@@ -53,7 +53,22 @@ impl InputBackend for EiInput {
 
     type SwitchToggleEvent = input::UnusedEvent;
 
-    type SpecialEvent = input::UnusedEvent;
+    type SpecialEvent = EiSpecialEvent;
+}
+
+/// An ei event with no equivalent in [`InputEvent`]'s own variants.
+#[derive(Debug)]
+pub enum EiSpecialEvent {
+    /// The client stopped emulating on a device.
+    ///
+    /// Touches on that device should be reset: the protocol says a device that stops
+    /// emulating logically releases them.
+    StopEmulating(request::DeviceStopEmulating),
+    /// The client released a device's `ei_touchscreen` interface, keeping the device.
+    ///
+    /// Distinct from [`Self::StopEmulating`]: the protocol says a released interface is not
+    /// reinitialized on that device, so unlike a stop, no replacement touchscreen is coming.
+    TouchscreenReleased(request::TouchscreenReleased),
 }
 
 impl input::Device for request::Device {
@@ -287,6 +302,8 @@ impl input::AbsolutePositionEvent<EiInput> for request::TouchMotion {
         self.y.into()
     }
 }
+
+impl input::TouchFrameEvent<EiInput> for request::Frame {}
 
 impl input::TouchCancelEvent<EiInput> for request::TouchCancel {}
 impl input::TouchEvent<EiInput> for request::TouchCancel {

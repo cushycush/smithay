@@ -147,3 +147,14 @@ harness = false
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# Two reis fixes, pinned until they land upstream. First, ei_touchscreen.release was handled
+# entirely inside reis, so the server never learned the client had given up touch and any contact
+# it had applied was stranded. Second, reis treated ei_device.frame as a connection-wide
+# transaction boundary, so one device's frame delivered every other device's pending operations
+# under its own timestamp, and the frame those operations were really waiting for was then dropped
+# for having nothing left to deliver. Note this only takes effect when building smithay itself; a
+# workspace consuming smithay has to repeat the patch, since patches apply from the workspace root
+# only.
+[patch.crates-io]
+reis = { git = "https://github.com/cushycush/reis", rev = "547a7e7349d8f13b372e419ea5946f00af99dbb2" }

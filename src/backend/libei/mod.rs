@@ -59,7 +59,7 @@ use std::{
 use crate::backend::input::InputEvent;
 
 mod input;
-pub use input::ScrollEvent;
+pub use input::{EiSpecialEvent, ScrollEvent};
 mod seat;
 pub use seat::{EiInputSeat, EiRegion};
 
@@ -281,7 +281,18 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         EisRequest::TouchMotion(event) => Some(InputEvent::TouchMotion { event }),
         EisRequest::TouchCancel(event) => Some(InputEvent::TouchCancel { event }),
         EisRequest::DeviceClosed(event) => Some(InputEvent::DeviceRemoved { device: event.device }),
-        EisRequest::Frame(_) => None,
+        // A frame is the transaction boundary for the operations a device has queued, and only
+        // touch has an equivalent here. Frames from other devices carry nothing to deliver.
+        EisRequest::Frame(event) => event
+            .device
+            .has_capability(DeviceCapability::Touch)
+            .then(|| InputEvent::TouchFrame { event }),
+        EisRequest::DeviceStopEmulating(event) => Some(InputEvent::Special(EiSpecialEvent::StopEmulating(
+            event,
+        ))),
+        EisRequest::TouchscreenReleased(event) => Some(InputEvent::Special(
+            EiSpecialEvent::TouchscreenReleased(event),
+        )),
         // TODO: handle `TextKeysym`/`TextUtf8` once `add_text()` support is added.
         EisRequest::TextKeysym(_)
         | EisRequest::TextUtf8(_)
@@ -289,7 +300,6 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         | EisRequest::Bind(_)
         | EisRequest::RequestDevice(_)
         | EisRequest::Ready(_)
-        | EisRequest::DeviceStartEmulating(_)
-        | EisRequest::DeviceStopEmulating(_) => None,
+        | EisRequest::DeviceStartEmulating(_) => None,
     }
 }

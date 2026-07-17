@@ -393,6 +393,32 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         });
     }
 
+    /// Tear the whole touch stream down, unconditionally.
+    ///
+    /// Unlike [`TouchHandle::cancel`], this does not depend on a pending frame: it cancels every
+    /// slot that still holds a focus, discharges any frame owed to a slot that saw `up` without a
+    /// following `frame`, drops all slot state, and finally unsets any active grab (running its
+    /// `unset` hook).
+    ///
+    /// [`TouchHandle::cancel`] is the right call when the compositor decides an *ongoing* touch
+    /// sequence is really a global gesture: it rides the pending frame and is a no-op once the
+    /// frame has been delivered. This is the right call when the touch stream ends out of band and
+    /// no `up` or `cancel` will ever arrive for the live points, e.g. the touch device is unplugged,
+    /// the session is paused or locked, or an input-emulation client disconnects. In those cases
+    /// there is usually no pending frame, so `cancel` would silently do nothing and leave the
+    /// stored per-slot focus in place, delivering later motion to a client that should no longer
+    /// be receiving it.
+    ///
+    /// One `cancel` is sent per underlying target, deduplicated through [`TouchTarget::last_frame`].
+    ///
+    /// As with [`TouchHandle::unset_grab`], the internal lock is held while the grab's `unset` hook
+    /// runs, so that hook must not call back into this handle.
+    pub fn cancel_all(&self, data: &mut D) {
+        let mut inner = self.inner.lock().unwrap();
+        let seat = self.get_seat(data);
+        inner.cancel_all(data, &seat);
+    }
+
     /// Notify that a touch point has changed its shape.
     pub fn shape(&self, data: &mut D, event: &ShapeEvent) {
         let mut inner = self.inner.lock().unwrap();
@@ -679,6 +705,42 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         }
 
         frame_marker::remove(marker.0);
+    }
+
+    fn cancel_all(&mut self, data: &mut D, seat: &Seat<D>) {
+        // Reuse the pending frame if there is one, otherwise take a fresh marker: the whole point
+        // of this path is that it works after a frame has already been delivered.
+        let marker = self.frame_marker();
+
+        // Cancel every slot that still holds a live focus. `cancel` terminates all of the target's
+        // active points at once, so `last_frame` keeps it to one per underlying target.
+        for state in self.focus.values_mut() {
+            if let Some((focus, _)) = state.focus.take() {
+                if focus.last_frame(seat, data) != Some(marker) {
+                    focus.cancel(seat, data, marker);
+                }
+            }
+        }
+
+        // A slot that saw `up` without a following `frame` is still owed one. Discharge it, unless
+        // the target already took the cancel above, which ends the sequence anyway. This runs as a
+        // second pass so that a target with both an up'd slot and a live slot cannot have its
+        // cancel suppressed by a frame that the (unordered) slot map happened to reach first.
+        for state in self.focus.values_mut() {
+            if let Some(focus) = state.frame_pending.take() {
+                if focus.last_frame(seat, data) != Some(marker) {
+                    focus.frame(seat, data, marker);
+                }
+            }
+        }
+
+        self.focus.clear();
+        if let Some(marker) = self.pending_frame.take() {
+            frame_marker::remove(marker.0);
+        }
+
+        // Last, so the grab's own cleanup still sees a coherent (now empty) touch state.
+        self.unset_grab(data, seat);
     }
 
     fn shape(&mut self, data: &mut D, seat: &Seat<D>, event: &ShapeEvent) {

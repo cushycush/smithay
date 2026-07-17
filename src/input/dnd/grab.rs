@@ -460,6 +460,10 @@ where
         self.pointer_start_data.as_ref().unwrap()
     }
 
+    fn start_data_mut(&mut self) -> &mut PointerGrabStartData<D> {
+        self.pointer_start_data.as_mut().unwrap()
+    }
+
     fn unset(&mut self, data: &mut D) {
         if self.should_drop {
             self.drop(data, DndTarget::Pointer);
@@ -547,6 +551,10 @@ where
 
     fn start_data(&self) -> &TouchGrabStartData<D> {
         self.touch_start_data.as_ref().unwrap()
+    }
+
+    fn start_data_mut(&mut self) -> &mut TouchGrabStartData<D> {
+        self.touch_start_data.as_mut().unwrap()
     }
 
     fn unset(&mut self, data: &mut D) {

@@ -100,6 +100,17 @@ pub trait TouchGrab<D: SeatHandler>: Send + Downcast {
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
 
+    /// Mutable access to the data about the event that started the grab.
+    ///
+    /// [`TouchDownGrab`] seeds every later touch point from `start_data.focus` rather
+    /// than from the focus resolved for that point, and `TouchInternal::down` stores
+    /// what it is handed as that slot's origin. A compositor whose surface origins
+    /// depend on where the event happened (a zoomed or scrolled view) must therefore
+    /// be able to recompute the origin at the new point's location before the down is
+    /// dispatched, or the second finger is delivered relative to the first one's
+    /// origin. This is the hook for that; it dispatches nothing.
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D>;
+
     /// The grab has been unset or replaced with another grab.
     fn unset(&mut self, data: &mut D);
 }
@@ -200,6 +211,10 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for DefaultGrab {
         unreachable!()
     }
 
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D> {
+        unreachable!()
+    }
+
     fn unset(&mut self, _data: &mut D) {}
 }
 
@@ -273,6 +288,10 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for TouchDownGrab<D> {
 
     fn start_data(&self) -> &GrabStartData<D> {
         &self.start_data
+    }
+
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D> {
+        &mut self.start_data
     }
 
     fn unset(&mut self, _data: &mut D) {}

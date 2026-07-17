@@ -267,6 +267,10 @@ impl PointerGrab<Smallvil> for ResizeSurfaceGrab {
         &self.start_data
     }
 
+    fn start_data_mut(&mut self) -> &mut PointerGrabStartData<Smallvil> {
+        &mut self.start_data
+    }
+
     fn unset(&mut self, _data: &mut Smallvil) {}
 }
 

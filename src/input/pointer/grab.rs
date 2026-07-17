@@ -168,6 +168,15 @@ pub trait PointerGrab<D: SeatHandler>: Send + Downcast {
     );
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
+    /// Mutable access to the data about the event that started the grab.
+    ///
+    /// Grabs that pin the press-time focus (see [`ClickGrab`]) deliver coordinates
+    /// relative to the origin stored in `start_data.focus`. That origin is baked at
+    /// the location of the event that started the grab, so a compositor whose surface
+    /// origins depend on where the event happened (a zoomed or scrolled view) must be
+    /// able to recompute it at the location it is about to deliver. This is the hook
+    /// for that; it dispatches nothing.
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D>;
     /// The grab has been unset or replaced with another grab.
     fn unset(&mut self, data: &mut D);
 }
@@ -333,6 +342,10 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for DefaultGrab {
         unreachable!()
     }
 
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D> {
+        unreachable!()
+    }
+
     fn unset(&mut self, _data: &mut D) {}
 }
 
@@ -464,6 +477,10 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for ClickGrab<D> {
 
     fn start_data(&self) -> &GrabStartData<D> {
         &self.start_data
+    }
+
+    fn start_data_mut(&mut self) -> &mut GrabStartData<D> {
+        &mut self.start_data
     }
 
     fn unset(&mut self, _data: &mut D) {}

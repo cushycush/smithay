@@ -17,6 +17,8 @@ pub use cursor_icon::CursorIcon;
 pub use cursor_image::{CursorImageAttributes, CursorImageStatus, CursorImageSurfaceData};
 
 mod grab;
+#[cfg(test)]
+mod tests;
 use grab::DefaultGrab;
 pub use grab::{ClickGrab, GrabStartData, PointerGrab};
 use tracing::{info_span, instrument};
@@ -473,6 +475,37 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         *self.wl_pointer.last_enter.lock().unwrap()
     }
 
+    /// Recompute the origin the active grab pins its delivered coordinates against.
+    ///
+    /// Grabs like [`ClickGrab`](crate::input::pointer::ClickGrab) ignore the focus handed
+    /// to [`Self::motion`] and deliver `location - start_data.focus.1` instead, where that
+    /// origin was baked when the grab started. If a compositor's surface origins depend on
+    /// where the event happened (a zoomed or scrolled view), an origin baked at the press
+    /// is wrong everywhere else, so it has to be recomputed at the location about to be
+    /// delivered.
+    ///
+    /// `f` is handed the pinned target and returns its origin at that location, or [`None`]
+    /// to leave the stored origin alone. Call this immediately before dispatching, while
+    /// holding no other lock: it takes the pointer's inner mutex briefly and dispatches
+    /// nothing.
+    ///
+    /// Does nothing when no grab is active; [`DefaultGrab`](crate::input::pointer::DefaultGrab)
+    /// resolves focus per event and has no pinned origin to refresh.
+    pub fn with_grab_origin<F>(&self, f: F)
+    where
+        F: FnOnce(&<D as SeatHandler>::PointerFocus) -> Option<Point<f64, Logical>>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if let GrabStatus::Active(_, handler) = &mut inner.grab {
+            let start_data = handler.start_data_mut();
+            if let Some((target, origin)) = start_data.focus.as_mut() {
+                if let Some(new_origin) = f(target) {
+                    *origin = new_origin;
+                }
+            }
+        }
+    }
+
     fn get_seat(&self, data: &mut D) -> Seat<D> {
         let seat_state = data.seat_state();
         seat_state
@@ -492,6 +525,17 @@ where
     /// Retrieve the current pointer focus
     pub fn current_focus(&self) -> Option<<D as SeatHandler>::PointerFocus> {
         self.inner.lock().unwrap().focus.clone().map(|(focus, _)| focus)
+    }
+
+    /// Retrieve the current pointer focus together with the origin it is delivered against
+    /// (DRIFT-1367). `current_focus` drops the origin; a compositor that synthesizes motion when the
+    /// world moves under a still cursor needs it, so it can tell whether a freshly resolved
+    /// `(focus, origin)` would be byte-identical to what the client already holds and skip a
+    /// redundant delivery. Reads the same stored pair the next `motion` will overwrite.
+    pub fn current_focus_and_origin(
+        &self,
+    ) -> Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)> {
+        self.inner.lock().unwrap().focus.clone()
     }
 }
 

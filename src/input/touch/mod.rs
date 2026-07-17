@@ -16,6 +16,8 @@ pub use grab::{DefaultGrab, GrabStartData, TouchDownGrab, TouchGrab};
 use super::{GrabStatus, Seat, SeatHandler};
 
 mod grab;
+#[cfg(test)]
+mod tests;
 
 crate::utils::ids::id_gen!(frame_marker);
 
@@ -435,6 +437,62 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         inner.with_grab(data, &seat, |data, handle, grab| {
             grab.orientation(data, handle, event);
         });
+    }
+
+    /// Recompute the origin each live touch slot has its delivered coordinates pinned to.
+    ///
+    /// [`TouchInternal::motion`] ignores the focus it is handed and delivers
+    /// `location - loc` using the origin stored for that slot at [`Self::down`]. If a
+    /// compositor's surface origins depend on where the event happened (a zoomed or
+    /// scrolled view), an origin baked at the down is wrong once the view moves or the
+    /// finger travels, so it has to be recomputed at the slot's current location.
+    ///
+    /// `f` is handed each live slot and its pinned target, and returns that target's origin
+    /// at that slot's location, or [`None`] to leave the stored origin alone. Slot-specific
+    /// by construction: two fingers on the same target under a zoomed view resolve
+    /// different origins.
+    ///
+    /// Call this immediately before dispatching. It takes the inner mutex briefly and
+    /// dispatches nothing.
+    pub fn with_slot_origins<F>(&self, mut f: F)
+    where
+        F: FnMut(TouchSlot, &<D as SeatHandler>::TouchFocus) -> Option<Point<f64, Logical>>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        for (slot, state) in inner.focus.iter_mut() {
+            if let Some((target, origin)) = state.focus.as_mut() {
+                if let Some(new_origin) = f(*slot, target) {
+                    *origin = new_origin;
+                }
+            }
+        }
+    }
+
+    /// Recompute the origin the active grab seeds *new* touch points from.
+    ///
+    /// [`TouchDownGrab`] hands `start_data.focus` to every later down instead of the focus
+    /// resolved for that point, and [`TouchInternal::down`] stores it as that slot's origin.
+    /// So a second finger is delivered against the first finger's origin, which under a
+    /// zoomed or scrolled view is wrong by the distance between them. Recompute it at the
+    /// new point's location before dispatching the down; [`Self::with_slot_origins`] cannot
+    /// reach this, because the slot does not exist yet.
+    ///
+    /// `f` is handed the pinned target and returns its origin at the down's location, or
+    /// [`None`] to leave the stored origin alone. Takes the inner mutex briefly and
+    /// dispatches nothing.
+    pub fn with_grab_origin<F>(&self, f: F)
+    where
+        F: FnOnce(&<D as SeatHandler>::TouchFocus) -> Option<Point<f64, Logical>>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if let GrabStatus::Active(_, handler) = &mut inner.grab {
+            let start_data = handler.start_data_mut();
+            if let Some((target, origin)) = start_data.focus.as_mut() {
+                if let Some(new_origin) = f(target) {
+                    *origin = new_origin;
+                }
+            }
+        }
     }
 
     fn get_seat(&self, data: &mut D) -> Seat<D> {

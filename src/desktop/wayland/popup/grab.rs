@@ -377,6 +377,15 @@ where
         &self.pointer_grab_start_data
     }
 
+    /// Mutable access to the start data of the pointer grab.
+    ///
+    /// See [`PointerGrab::start_data_mut`](crate::input::pointer::PointerGrab::start_data_mut):
+    /// this exists so a compositor can recompute the pinned origin at the location it is
+    /// about to deliver.
+    pub fn pointer_grab_start_data_mut(&mut self) -> &mut PointerGrabStartData<D> {
+        &mut self.pointer_grab_start_data
+    }
+
     fn unset_keyboard_grab(&self, data: &mut D, serial: Serial) {
         if let Some(keyboard) = self.keyboard_handle.as_ref() {
             if keyboard.is_grabbed()
@@ -701,6 +710,10 @@ where
 
     fn start_data(&self) -> &PointerGrabStartData<D> {
         self.popup_grab.pointer_grab_start_data()
+    }
+
+    fn start_data_mut(&mut self) -> &mut PointerGrabStartData<D> {
+        self.popup_grab.pointer_grab_start_data_mut()
     }
 
     fn unset(&mut self, data: &mut D) {

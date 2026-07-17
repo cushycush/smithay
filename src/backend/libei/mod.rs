@@ -226,6 +226,10 @@ impl EventSource for EiInput {
                 }
                 Err(err) => {
                     tracing::error!("Libei client error: {}", err);
+                    // The connection is going away exactly as it does on a clean disconnect, so
+                    // say so. Without this a consumer keeping per-connection state only ever
+                    // hears about the tidy exit and leaks the entry for every client that errors.
+                    cb(EiInputEvent::Disconnected, connection);
                     return Ok(PostAction::Remove);
                 }
             }

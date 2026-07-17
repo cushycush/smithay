@@ -184,6 +184,31 @@ impl EiInputSeat {
         inner.device_touch.as_ref().map(|wrapper| wrapper.device.clone())
     }
 
+    // Drop the wrapper for a device the client closed, completing the protocol teardown.
+    // Returns whether this seat owned the device.
+    //
+    // The removal has already been announced by the caller, so the wrapper is told not to
+    // announce it again on the way out.
+    pub(super) fn device_closed(&self, device: &reis::request::Device) -> bool {
+        let mut guard = self.0.lock().unwrap();
+        let inner = &mut *guard;
+        for slot in [
+            &mut inner.device_keyboard,
+            &mut inner.device_pointer,
+            &mut inner.device_pointer_absolute,
+            &mut inner.device_touch,
+        ] {
+            if slot.as_ref().is_some_and(|wrapper| wrapper.device == *device) {
+                if let Some(wrapper) = slot.as_mut() {
+                    wrapper.removal_announced = true;
+                }
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove seat from EI connection
     pub fn remove(&self) {
         let inner = self.0.lock().unwrap();
@@ -312,6 +337,9 @@ fn emit_regions(device: &reis::request::Device, regions: &[EiRegion]) {
 struct DeviceDropWrapper {
     device: reis::request::Device,
     event_sender: calloop::channel::Sender<InputEvent<EiInput>>,
+    // Set when the removal has already been announced, so dropping completes the protocol
+    // teardown without announcing it a second time.
+    removal_announced: bool,
 }
 
 impl DeviceDropWrapper {
@@ -322,15 +350,18 @@ impl DeviceDropWrapper {
         Self {
             device,
             event_sender: event_sender.clone(),
+            removal_announced: false,
         }
     }
 }
 
 impl Drop for DeviceDropWrapper {
     fn drop(&mut self) {
-        let _ = self.event_sender.send(InputEvent::DeviceRemoved {
-            device: self.device.clone(),
-        });
+        if !self.removal_announced {
+            let _ = self.event_sender.send(InputEvent::DeviceRemoved {
+                device: self.device.clone(),
+            });
+        }
         self.device.remove();
     }
 }

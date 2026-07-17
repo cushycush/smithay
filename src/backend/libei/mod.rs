@@ -136,6 +136,15 @@ impl EiInputConnection {
         seat
     }
 
+    // Complete the teardown of a device the client closed, on whichever seat owns it.
+    fn device_closed(&self, device: &reis::request::Device) {
+        for seat in self.0.seats.lock().unwrap().iter() {
+            if seat.device_closed(device) {
+                break;
+            }
+        }
+    }
+
     /// Send buffered events on EI socket
     pub fn flush(&self) -> rustix::io::Result<()> {
         self.0.connection.flush()
@@ -219,6 +228,21 @@ impl EventSource for EiInput {
                         seat.bind(request.capabilities);
                     }
                 }
+                Ok(EisRequestSourceEvent::Request(EisRequest::DeviceClosed(request))) => {
+                    // Announce the removal before completing it. `Device::remove` drains the
+                    // device's interfaces and `has_capability` reads exactly those, so a
+                    // consumer told about the removal afterwards could no longer tell what
+                    // kind of device it just lost.
+                    cb(
+                        EiInputEvent::Event(InputEvent::DeviceRemoved {
+                            device: request.device.clone(),
+                        }),
+                        connection,
+                    );
+                    // reis requires `Device::remove` after a `DeviceClosed`; without it the
+                    // protocol destructor never goes out and the seat keeps a dead device.
+                    connection.device_closed(&request.device);
+                }
                 Ok(EisRequestSourceEvent::Request(request)) => {
                     if let Some(input_event) = convert_request(request) {
                         cb(EiInputEvent::Event(input_event), connection);
@@ -284,7 +308,6 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         EisRequest::TouchUp(event) => Some(InputEvent::TouchUp { event }),
         EisRequest::TouchMotion(event) => Some(InputEvent::TouchMotion { event }),
         EisRequest::TouchCancel(event) => Some(InputEvent::TouchCancel { event }),
-        EisRequest::DeviceClosed(event) => Some(InputEvent::DeviceRemoved { device: event.device }),
         // A frame is the transaction boundary for the operations a device has queued, and only
         // touch has an equivalent here. Frames from other devices carry nothing to deliver.
         EisRequest::Frame(event) => event
@@ -297,6 +320,8 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         EisRequest::TouchscreenReleased(event) => Some(InputEvent::Special(
             EiSpecialEvent::TouchscreenReleased(event),
         )),
+        // Handled in `process_events`, which has the connection needed to complete the teardown.
+        EisRequest::DeviceClosed(_) => None,
         // TODO: handle `TextKeysym`/`TextUtf8` once `add_text()` support is added.
         EisRequest::TextKeysym(_)
         | EisRequest::TextUtf8(_)

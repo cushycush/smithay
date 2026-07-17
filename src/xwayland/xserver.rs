@@ -359,7 +359,14 @@ impl Instance {
             trace!(?res, "read from XWayland displayfd");
 
             match res {
-                Ok(0) => return Ok(None),
+                // EOF. The write end of the displayfd pipe is only held by the
+                // Xwayland child, so a closed pipe means it exited before ever
+                // reporting a display number. Report that as an error, per this
+                // method's documented contract, so the caller learns the
+                // instance is gone. Returning Ok(None) here instead left a
+                // level-triggered source polling a permanently-readable fd
+                // forever with no signal to its user.
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
                 Ok(len) if (buf[..len]).contains(&b'\n') => return Ok(self.x11_socket.take()),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(err.into()),
@@ -409,4 +416,54 @@ unsafe fn unset_cloexec(fd: RawFd) -> std::io::Result<()> {
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+
+    use super::*;
+
+    /// An `Instance` reading from a pipe we drive by hand, standing in for the
+    /// displayfd Xwayland writes its display number to. The pipe carries the
+    /// same flags `spawn` gives the real one, so the read behaviour matches.
+    fn instance_on_pipe() -> (Instance, OwnedFd) {
+        let (recv, send) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC)
+                .expect("pipe");
+        let (x11_socket, _peer) = UnixStream::pair().expect("socketpair");
+        let instance = Instance {
+            display_lock: X11Lock::for_test(424242),
+            x11_socket: Some(x11_socket),
+            display_fd: recv,
+        };
+        (instance, send)
+    }
+
+    #[test]
+    fn take_socket_reports_eof_as_error() {
+        let (mut instance, send) = instance_on_pipe();
+
+        // Xwayland exits without writing a display number: the only write end
+        // of the pipe closes, so the read side reports EOF.
+        drop(send);
+
+        let err = instance
+            .take_socket()
+            .expect_err("EOF on the displayfd must be an error, not a not-ready-yet");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn take_socket_is_not_ready_until_the_newline_arrives() {
+        let (mut instance, send) = instance_on_pipe();
+
+        // A partial write (display number, no terminating newline yet) is not
+        // readiness and not an error: Xwayland is still alive and writing.
+        rustix::io::write(&send, b"42").expect("write");
+        assert!(instance.take_socket().expect("partial write is not an error").is_none());
+
+        rustix::io::write(&send, b"\n").expect("write");
+        assert!(instance.take_socket().expect("ready").is_some());
+    }
 }

@@ -118,6 +118,14 @@ impl X11Lock {
     pub(crate) fn display_number(&self) -> u32 {
         self.display
     }
+
+    /// Build a lock that owns no files, for tests that need an `Instance`
+    /// without claiming a real X11 display slot. Dropping it warns about two
+    /// files that were never created, which is harmless.
+    #[cfg(test)]
+    pub(crate) fn for_test(display: u32) -> X11Lock {
+        X11Lock { display }
+    }
 }
 
 impl Drop for X11Lock {

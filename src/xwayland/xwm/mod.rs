@@ -657,6 +657,28 @@ impl FocusReleaseHandle {
         self.pending.store(false, Ordering::Release);
     }
 
+    /// The half of this handle the ping source's own callback needs.
+    ///
+    /// Deliberately does NOT carry the `Ping`. The callback is owned by the event source, which
+    /// the event loop owns, so a `Ping` in there would keep itself alive: `PingSource` only
+    /// removes itself once every `Ping` has dropped, and one would never drop. That cycle leaks
+    /// the source, its eventfd and its slab slot for the life of the loop, every time a WM is
+    /// started.
+    fn dispatcher(&self) -> FocusReleaseDispatch {
+        FocusReleaseDispatch {
+            pending: self.pending.clone(),
+            conn: self.conn.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct FocusReleaseDispatch {
+    pending: Arc<AtomicBool>,
+    conn: Weak<RustConnection>,
+}
+
+impl FocusReleaseDispatch {
     fn dispatch(&self) {
         if !self.pending.swap(false, Ordering::AcqRel) {
             return;
@@ -1013,7 +1035,10 @@ impl X11Wm {
 
         let (focus_release, focus_release_source) = FocusReleaseHandle::new(&conn)?;
         {
-            let release = focus_release.clone();
+            // Hand the callback the dispatch half only, never a clone of the handle itself: see
+            // FocusReleaseHandle::dispatcher. With the Ping out of the callback, the source
+            // removes itself once this X11Wm and its surfaces are gone.
+            let release = focus_release.dispatcher();
             handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?;
         }
 

@@ -63,6 +63,9 @@ pub use input::{EiSpecialEvent, ScrollEvent};
 mod seat;
 pub use seat::{EiInputSeat, EiRegion};
 
+#[cfg(test)]
+mod tests;
+
 /// An [`EventSource`] for receiving input from an EI sender context and
 /// converting to [`InputEvent`]s.
 #[derive(Debug)]

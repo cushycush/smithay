@@ -5,7 +5,7 @@
 //!
 //! use reis::{calloop::EisListenerSource, eis};
 //! use smithay::{
-//!     backend::libei::{EiInput, EiInputEvent},
+//!     backend::libei::{EiInput, EiInputEvent, EiRegion},
 //!     input::keyboard::XkbConfig,
 //! };
 //!
@@ -17,11 +17,20 @@
 //!     handle.insert_source(source, |event, connection, _data| {
 //!         match event {
 //!              EiInputEvent::Connected => {
+//!                 // One region per output, describing the area these devices can reach.
+//!                 // Absolute pointer and touch devices must have at least one.
+//!                 let regions = vec![EiRegion {
+//!                     offset_x: 0,
+//!                     offset_y: 0,
+//!                     width: 1920,
+//!                     height: 1080,
+//!                     scale: 1.0,
+//!                 }];
 //!                 let seat = connection.add_seat("default");
 //!                 let _ = seat.add_keyboard("virtual keyboard", XkbConfig::default());
 //!                 seat.add_pointer("virtual pointer");
-//!                 seat.add_pointer_absolute("virtual absolute pointer");
-//!                 seat.add_touch("virtual touch");
+//!                 seat.add_pointer_absolute("virtual absolute pointer", regions.clone());
+//!                 seat.add_touch("virtual touch", regions);
 //!             }
 //!             EiInputEvent::Disconnected => {}
 //!             EiInputEvent::Event(event) => {
@@ -52,7 +61,7 @@ use crate::backend::input::InputEvent;
 mod input;
 pub use input::ScrollEvent;
 mod seat;
-pub use seat::EiInputSeat;
+pub use seat::{EiInputSeat, EiRegion};
 
 /// An [`EventSource`] for receiving input from an EI sender context and
 /// converting to [`InputEvent`]s.
@@ -81,8 +90,14 @@ impl EiInput {
 
 /// A connection for an EI sender context that can be used to add seats and
 /// devices.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EiInputConnection(Arc<EiInputConnectionInner>);
+
+impl PartialEq for EiInputConnection {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 #[derive(Debug)]
 struct EiInputConnectionInner {

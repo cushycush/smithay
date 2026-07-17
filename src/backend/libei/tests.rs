@@ -110,6 +110,27 @@ fn record(event: EiInputEvent, seat: Option<&EiInputSeat>) -> Rec {
     }
 }
 
+/// One tag per record, for asserting the exact shape of a short sequence.
+///
+/// Where a test cares about ordering rather than payloads, comparing tags says so directly and
+/// fails with the whole sequence rather than a bare `false`.
+fn tags(recs: &[Rec]) -> Vec<&'static str> {
+    recs.iter()
+        .map(|rec| match rec {
+            Rec::Connected => "connected",
+            Rec::Disconnected => "disconnected",
+            Rec::DeviceAdded { .. } => "device-added",
+            Rec::DeviceRemoved { .. } => "device-removed",
+            Rec::TouchDown { .. } => "touch-down",
+            Rec::TouchFrame { .. } => "touch-frame",
+            Rec::PointerMotionAbsolute { .. } => "pointer-motion-absolute",
+            Rec::StopEmulating { .. } => "stop-emulating",
+            Rec::TouchscreenReleased { .. } => "touchscreen-released",
+            Rec::Other => "other",
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct ServerState {
     connection: Option<EiInputConnection>,
@@ -834,6 +855,89 @@ fn releasing_the_touchscreen_keeps_the_device_and_reports_the_release() {
     );
 }
 
+// The next three tests pin what an unframed touch does at each of the three ways a touch
+// stream can end. Two of them commit the touch, one discards it, and the split is deliberate.
+//
+// reis synthesizes a frame before any request that carries no timestamp of its own but does
+// name a device, flushing whatever that device left pending. This is libeis behavior that reis
+// copies on purpose (its `queue_request` says as much), so a stop or a close commits an
+// unframed touch rather than dropping it. We keep it: matching libeis is the point of an EIS
+// implementation, and a consumer that diverges here would behave differently from every other
+// EIS server for the same client bytes.
+//
+// A touchscreen release is the exception, and the reason for the pinned reis fork. Its request
+// reports no device precisely so that no frame can be synthesized onto an interface that is
+// being destroyed, and its pending touches are purged instead.
+
+#[test]
+fn stopping_emulation_commits_an_unframed_touch() {
+    let mut harness = Harness::new();
+    harness.connect(|harness| {
+        let seat = harness.add_seat("seat");
+        seat.add_touch("touch", touch_regions());
+        seat
+    });
+
+    let touch = harness.client.devices_named("touch")[0].clone();
+    harness.client.start_emulating(&touch);
+    // A down the client never frames, so it is still pending when emulation stops.
+    harness.client.touchscreen(&touch).down(1, 10.0, 10.0);
+    touch.stop_emulating(harness.client.last_serial);
+    harness.pump();
+
+    // The frame between the down and the stop is synthesized by reis, not sent by the client.
+    // The consumer therefore applies a touch the client never committed and then immediately
+    // hears the stop that ends it, which nets out as a tap nobody asked for. That is what
+    // libeis does with the same bytes, so it is the behavior we want.
+    assert_eq!(
+        tags(harness.recs()),
+        [
+            "connected",
+            "device-added",
+            "touch-down",
+            "touch-frame",
+            "stop-emulating"
+        ],
+        "an unframed down should be committed by a synthesized frame before the stop"
+    );
+}
+
+#[test]
+fn closing_a_device_commits_an_unframed_touch() {
+    let mut harness = Harness::new();
+    harness.connect(|harness| {
+        let seat = harness.add_seat("seat");
+        seat.add_touch("touch", touch_regions());
+        seat
+    });
+
+    let touch = harness.client.devices_named("touch")[0].clone();
+    harness.client.start_emulating(&touch);
+    // A down the client never frames, so it is still pending when the device is closed.
+    harness.client.touchscreen(&touch).down(1, 10.0, 10.0);
+    touch.release();
+    harness.pump();
+
+    // Same synthesis as the stop above: closing a device names it, so reis flushes what the
+    // device had pending first. The frame lands before the removal because the drain that
+    // strips the device's interfaces only happens once the closure itself is handled.
+    assert_eq!(
+        tags(harness.recs()),
+        [
+            "connected",
+            "device-added",
+            "touch-down",
+            "touch-frame",
+            "device-removed"
+        ],
+        "an unframed down should be committed by a synthesized frame before the removal"
+    );
+}
+
+// The contrast to the two tests above, and the case the reis fork exists for: a touchscreen
+// release purges its own unframed touches instead of committing them, because a synthesized
+// frame would be landing on an interface that is being destroyed. The touch is never delivered
+// at all, so nothing downstream has a contact to tear down.
 #[test]
 fn releasing_the_touchscreen_purges_only_its_own_unframed_operations() {
     let mut harness = Harness::new();

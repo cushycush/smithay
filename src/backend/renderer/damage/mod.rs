@@ -541,7 +541,13 @@ impl OutputDamageTracker {
             let element_last_state = self.last_state.elements.get(element.id());
             let element_is_framebuffer_effect = element.is_framebuffer_effect();
 
-            self.element_damage_index.push(self.damage.len());
+            // Where this element's own damage starts. `element_damage_index` records the point the
+            // framebuffer-effect loop below starts scanning from when it asks "did anything BELOW me
+            // change?", and elements are appended front-to-back, so everything at or after an
+            // element's recorded index belongs to elements behind it -- PROVIDED the element's own
+            // damage is excluded. Which of the two branches below ran decides whether that is true,
+            // so the push moved into the branches rather than sitting here.
+            let damage_index_before_element = self.damage.len();
             if element_last_state
                 .map(|s| {
                     !s.instance_matches(
@@ -566,6 +572,17 @@ impl OutputDamageTracker {
                             .filter_map(|i| i.last_geometry.intersection(output_geo)),
                     );
                 }
+                // This branch is a NEW, MOVED, re-alpha'd or re-ordered element, not a repaint. For a
+                // framebuffer effect that is genuine invalidation: what it sampled last frame was
+                // taken from a different rect, so the cached artifact is unusable. Record the
+                // pre-element index so the effect loop sees this push and sets `needs_capture`.
+                //
+                // Not merely an optimization to get right. The `effects_cache` entry is created ONLY
+                // inside that `needs_capture` branch, and `draw()` is handed `effects_cache.get(id)`,
+                // so an effect element whose first appearance failed to set it would be handed `None`
+                // and paint nothing at all. `element_last_state == None` always lands here, which is
+                // what keeps a first-appearance effect painting.
+                self.element_damage_index.push(damage_index_before_element);
             } else {
                 let element_output_damage = element
                     .damage_since(
@@ -579,6 +596,16 @@ impl OutputDamageTracker {
                     })
                     .filter_map(|geo| geo.intersection(output_geo));
                 self.damage.extend(element_output_damage);
+                // The element is in the same place with the same instance and merely repainted its
+                // own content. Under painter's algorithm that re-rasterizes the pixels beneath it
+                // byte-identically, so a framebuffer effect's cached capture stays exact and it must
+                // NOT be treated as below-damage. Record the POST-element index so the scan below
+                // skips what we just appended.
+                //
+                // This one index is the whole bug behind Drift's DRIFT-1423: recording the
+                // pre-element index here made every effect element trip its own below-damage test, so
+                // a backdrop blur re-ran its full Gaussian on any frame it merely repainted itself.
+                self.element_damage_index.push(self.damage.len());
             }
 
             let element_opaque_regions_start_index = self.opaque_regions.len();
@@ -687,9 +714,20 @@ impl OutputDamageTracker {
         }
 
         // for backdrop elements check if anything below them changed and add full-damage, if it did.
+        //
+        // Walked BACK-TO-FRONT (descending z, i.e. bottom effect first) because an effect that
+        // decides to capture appends its own intersection to the TAIL of `self.damage` below, and
+        // that append has to be visible to exactly the effects above it and to none below. Walking
+        // front-to-back gets it wrong in both directions at once when two effects are stacked: the
+        // front one is tested before the rear one appends (so it never learns the surface beneath it
+        // was rebuilt, and reuses a stale blur over changed pixels), while the rear one is tested
+        // after the front one appended (so it reads a rect from ABOVE it as below-damage and re-runs
+        // its Gaussian for nothing). Bottom-up, each append lands before the tests that should see it
+        // and after the tests that should not.
         for (z_index, element) in render_elements
             .iter()
             .enumerate()
+            .rev()
             .filter(|(_, e)| e.is_framebuffer_effect())
         {
             let damage_index = if force_effect_redraw {

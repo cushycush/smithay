@@ -686,6 +686,18 @@ impl OutputDamageTracker {
         element_damage.extend_from_slice(&self.last_state.opaque_regions);
         element_damage =
             Rectangle::subtract_rects_many_in_place(element_damage, self.opaque_regions.iter().copied());
+        // Drop degenerate leftovers before deciding anything from them. A zero-area rect is not a
+        // region that stopped being covered, but it does survive the subtraction, and it used to make
+        // the emptiness test below report work that does not exist.
+        //
+        // That mattered because this loop feeds itself. When a framebuffer effect captures, it clears
+        // the opaque regions above it (further down) by overwriting each with the remainder of a
+        // subtraction, defaulting to a ZERO rect when nothing remains. Those zero rects are stored in
+        // last_state.opaque_regions, so the next frame subtracted them, found a non-empty vec of
+        // nothing, forced an effect redraw, captured again, and wrote the zero rects back. Once an
+        // effect element had an opaque element above it, every later frame re-ran the blur no matter
+        // what had actually changed on screen.
+        element_damage.retain(|rect| !rect.is_empty());
         if !element_damage.is_empty() {
             force_effect_redraw = true;
         }

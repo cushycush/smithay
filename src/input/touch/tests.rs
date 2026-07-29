@@ -703,6 +703,10 @@ fn delivered_record_clears_when_up_consumes_the_live_focus() {
     assert!(delivered_for(&touch, 0).is_some());
     touch.up(&mut state, &up_event(0));
     assert_eq!(delivered_for(&touch, 0), None);
+    assert!(
+        touch.has_pending_frame(),
+        "an up still owes a frame even though it clears the delivered record"
+    );
 }
 
 #[test]
@@ -719,6 +723,10 @@ fn delivered_record_clears_when_cancel_consumes_the_live_focus() {
     assert!(delivered_for(&touch, 0).is_some());
     touch.cancel(&mut state);
     assert_eq!(delivered_for(&touch, 0), None);
+    assert!(
+        !touch.has_pending_frame(),
+        "cancel consumes the pending marker while clearing the delivered record"
+    );
 }
 
 #[test]

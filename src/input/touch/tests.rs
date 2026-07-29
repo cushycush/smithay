@@ -14,21 +14,27 @@ use std::sync::{Arc, Mutex};
 use crate::{
     backend::input::TouchSlot,
     input::{
+        Seat, SeatHandler, SeatState,
         touch::{
             DownEvent, FrameMarker, GrabStartData, MotionEvent, OrientationEvent, ShapeEvent, TouchGrab,
-            TouchInnerHandle, TouchTarget, UpEvent,
+            TouchHandle, TouchInnerHandle, TouchTarget, UpEvent,
         },
-        Seat, SeatHandler, SeatState,
     },
-    utils::{IsAlive, Logical, Point, Serial, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Serial},
 };
 
 /// What a target actually received, in ITS OWN coordinates. The whole point: assert on the
 /// delivery, never on the stored origin, or the test proves nothing about what the client sees.
 #[derive(Debug, Clone, PartialEq)]
 enum Delivered {
-    Down { slot: TouchSlot, location: Point<f64, Logical> },
-    Motion { slot: TouchSlot, location: Point<f64, Logical> },
+    Down {
+        slot: TouchSlot,
+        location: Point<f64, Logical>,
+    },
+    Motion {
+        slot: TouchSlot,
+        location: Point<f64, Logical>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -89,7 +95,14 @@ impl TouchTarget<State> for Target {
 
 /// Keyboard and pointer focus are unused here, but `SeatHandler` demands the types.
 impl crate::input::keyboard::KeyboardTarget<State> for Target {
-    fn enter(&self, _: &Seat<State>, _: &mut State, _: Vec<crate::input::keyboard::KeysymHandle<'_>>, _: Serial) {}
+    fn enter(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: Vec<crate::input::keyboard::KeysymHandle<'_>>,
+        _: Serial,
+    ) {
+    }
     fn leave(&self, _: &Seat<State>, _: &mut State, _: Serial) {}
     fn key(
         &self,
@@ -101,26 +114,85 @@ impl crate::input::keyboard::KeyboardTarget<State> for Target {
         _: u32,
     ) {
     }
-    fn modifiers(&self, _: &Seat<State>, _: &mut State, _: crate::input::keyboard::ModifiersState, _: Serial) {}
+    fn modifiers(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: crate::input::keyboard::ModifiersState,
+        _: Serial,
+    ) {
+    }
 }
 
 impl crate::input::pointer::PointerTarget<State> for Target {
     fn enter(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::MotionEvent) {}
     fn motion(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::MotionEvent) {}
-    fn relative_motion(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::RelativeMotionEvent) {}
+    fn relative_motion(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::RelativeMotionEvent,
+    ) {
+    }
     fn button(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::ButtonEvent) {}
     fn axis(&self, _: &Seat<State>, _: &mut State, _: crate::input::pointer::AxisFrame) {}
     fn frame(&self, _: &Seat<State>, _: &mut State) {}
-    fn gesture_swipe_begin(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GestureSwipeBeginEvent) {}
-    fn gesture_swipe_update(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GestureSwipeUpdateEvent) {
+    fn gesture_swipe_begin(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GestureSwipeBeginEvent,
+    ) {
     }
-    fn gesture_swipe_end(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GestureSwipeEndEvent) {}
-    fn gesture_pinch_begin(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GesturePinchBeginEvent) {}
-    fn gesture_pinch_update(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GesturePinchUpdateEvent) {
+    fn gesture_swipe_update(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GestureSwipeUpdateEvent,
+    ) {
     }
-    fn gesture_pinch_end(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GesturePinchEndEvent) {}
-    fn gesture_hold_begin(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GestureHoldBeginEvent) {}
-    fn gesture_hold_end(&self, _: &Seat<State>, _: &mut State, _: &crate::input::pointer::GestureHoldEndEvent) {}
+    fn gesture_swipe_end(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GestureSwipeEndEvent,
+    ) {
+    }
+    fn gesture_pinch_begin(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GesturePinchBeginEvent,
+    ) {
+    }
+    fn gesture_pinch_update(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GesturePinchUpdateEvent,
+    ) {
+    }
+    fn gesture_pinch_end(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GesturePinchEndEvent,
+    ) {
+    }
+    fn gesture_hold_begin(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GestureHoldBeginEvent,
+    ) {
+    }
+    fn gesture_hold_end(
+        &self,
+        _: &Seat<State>,
+        _: &mut State,
+        _: &crate::input::pointer::GestureHoldEndEvent,
+    ) {
+    }
     fn leave(&self, _: &Seat<State>, _: &mut State, _: Serial, _: u32) {}
 }
 
@@ -183,7 +255,72 @@ impl TouchGrab<State> for PinningGrab {
         handle.shape(data, event);
     }
 
-    fn orientation(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>, event: &OrientationEvent) {
+    fn orientation(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        event: &OrientationEvent,
+    ) {
+        handle.orientation(data, event);
+    }
+
+    fn start_data(&self) -> &GrabStartData<State> {
+        &self.start_data
+    }
+
+    fn start_data_mut(&mut self) -> &mut GrabStartData<State> {
+        &mut self.start_data
+    }
+
+    fn unset(&mut self, _data: &mut State) {}
+}
+
+struct DroppingMotionGrab {
+    start_data: GrabStartData<State>,
+}
+
+impl TouchGrab<State> for DroppingMotionGrab {
+    fn down(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        focus: Option<(Target, Point<f64, Logical>)>,
+        event: &DownEvent,
+    ) {
+        handle.down(data, focus, event);
+    }
+
+    fn up(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>, event: &UpEvent) {
+        handle.up(data, event);
+    }
+
+    fn motion(
+        &mut self,
+        _data: &mut State,
+        _handle: &mut TouchInnerHandle<'_, State>,
+        _focus: Option<(Target, Point<f64, Logical>)>,
+        _event: &MotionEvent,
+    ) {
+    }
+
+    fn frame(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
+        handle.frame(data);
+    }
+
+    fn cancel(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
+        handle.cancel(data);
+    }
+
+    fn shape(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>, event: &ShapeEvent) {
+        handle.shape(data, event);
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        event: &OrientationEvent,
+    ) {
         handle.orientation(data, event);
     }
 
@@ -213,6 +350,24 @@ fn motion_event(slot: u32, location: Point<f64, Logical>) -> MotionEvent {
         location,
         time: 0,
     }
+}
+
+fn up_event(slot: u32) -> UpEvent {
+    UpEvent {
+        slot: Some(slot).into(),
+        serial: SERIAL_COUNTER.next_serial(),
+        time: 0,
+    }
+}
+
+fn delivered_for(touch: &TouchHandle<State>, slot: u32) -> Option<(Target, Point<f64, Logical>)> {
+    touch
+        .inner
+        .lock()
+        .unwrap()
+        .focus
+        .get(&TouchSlot::from(Some(slot)))
+        .and_then(|state| state.delivered.clone())
 }
 
 /// A stand-in for a view whose origins depend on where you look: a target's origin at
@@ -260,7 +415,11 @@ fn second_touch_down_uses_its_own_origin_not_the_first_fingers() {
         },
         SERIAL_COUNTER.next_serial(),
     );
-    touch.down(&mut state, Some((target.clone(), first_origin)), &down_event(0, first_location));
+    touch.down(
+        &mut state,
+        Some((target.clone(), first_origin)),
+        &down_event(0, first_location),
+    );
     touch.frame(&mut state);
     assert_eq!(
         recorder.take(),
@@ -274,13 +433,20 @@ fn second_touch_down_uses_its_own_origin_not_the_first_fingers() {
     // Finger 2 lands somewhere else. Refresh the grab's pinned origin at ITS location first.
     let second_location: Point<f64, Logical> = (300.0, 200.0).into();
     let second_origin = origin_at(base, second_location, k);
-    assert_ne!(first_origin, second_origin, "the test is vacuous if the origins match");
+    assert_ne!(
+        first_origin, second_origin,
+        "the test is vacuous if the origins match"
+    );
 
     touch.with_grab_origin(|t| {
         assert_eq!(t, &target);
         Some(second_origin)
     });
-    touch.down(&mut state, Some((target.clone(), second_origin)), &down_event(1, second_location));
+    touch.down(
+        &mut state,
+        Some((target.clone(), second_origin)),
+        &down_event(1, second_location),
+    );
     touch.frame(&mut state);
 
     assert_eq!(
@@ -306,29 +472,55 @@ fn slot_origins_refresh_independently_per_slot() {
 
     let a_down: Point<f64, Logical> = (100.0, 100.0).into();
     let b_down: Point<f64, Logical> = (400.0, 300.0).into();
-    touch.down(&mut state, Some((target.clone(), origin_at(base, a_down, k))), &down_event(0, a_down));
-    touch.down(&mut state, Some((target.clone(), origin_at(base, b_down, k))), &down_event(1, b_down));
+    touch.down(
+        &mut state,
+        Some((target.clone(), origin_at(base, a_down, k))),
+        &down_event(0, a_down),
+    );
+    touch.down(
+        &mut state,
+        Some((target.clone(), origin_at(base, b_down, k))),
+        &down_event(1, b_down),
+    );
     touch.frame(&mut state);
     let _ = recorder.take();
 
     // Both fingers move. Each slot's origin must be recomputed at that slot's new location.
     let a_moved: Point<f64, Logical> = (150.0, 120.0).into();
     let b_moved: Point<f64, Logical> = (380.0, 340.0).into();
-    let locations = [(TouchSlot::from(Some(0)), a_moved), (TouchSlot::from(Some(1)), b_moved)];
+    let locations = [
+        (TouchSlot::from(Some(0)), a_moved),
+        (TouchSlot::from(Some(1)), b_moved),
+    ];
 
-    touch.with_slot_origins(|slot, t| {
+    touch.with_slot_origins(|slot, t, _, _| {
         assert_eq!(t, &target);
-        let location = locations.iter().find(|(s, _)| *s == slot).map(|(_, l)| *l).unwrap();
+        let location = locations
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, l)| *l)
+            .unwrap();
         Some(origin_at(base, location, k))
     });
 
-    touch.motion(&mut state, Some((target.clone(), origin_at(base, a_moved, k))), &motion_event(0, a_moved));
-    touch.motion(&mut state, Some((target.clone(), origin_at(base, b_moved, k))), &motion_event(1, b_moved));
+    touch.motion(
+        &mut state,
+        Some((target.clone(), origin_at(base, a_moved, k))),
+        &motion_event(0, a_moved),
+    );
+    touch.motion(
+        &mut state,
+        Some((target.clone(), origin_at(base, b_moved, k))),
+        &motion_event(1, b_moved),
+    );
     touch.frame(&mut state);
 
     let a_origin = origin_at(base, a_moved, k);
     let b_origin = origin_at(base, b_moved, k);
-    assert_ne!(a_origin, b_origin, "the test is vacuous if both slots share an origin");
+    assert_ne!(
+        a_origin, b_origin,
+        "the test is vacuous if both slots share an origin"
+    );
     assert_eq!(
         recorder.take(),
         vec![
@@ -354,19 +546,30 @@ fn returning_none_preserves_the_stored_origin() {
 
     let origin: Point<f64, Logical> = (25.0, 25.0).into();
     let location: Point<f64, Logical> = (100.0, 100.0).into();
-    touch.down(&mut state, Some((target.clone(), origin)), &down_event(0, location));
+    touch.down(
+        &mut state,
+        Some((target.clone(), origin)),
+        &down_event(0, location),
+    );
     touch.frame(&mut state);
     let _ = recorder.take();
 
     let mut saw_target = false;
-    touch.with_slot_origins(|_, _| {
+    touch.with_slot_origins(|_, seen_target, current_origin, delivered| {
         saw_target = true;
+        assert_eq!(seen_target, &target);
+        assert_eq!(current_origin, origin);
+        assert_eq!(delivered.cloned(), Some((target.clone(), location - origin)));
         None
     });
     assert!(saw_target, "the callback still sees the live slot");
 
     let moved: Point<f64, Logical> = (140.0, 130.0).into();
-    touch.motion(&mut state, Some((target.clone(), origin)), &motion_event(0, moved));
+    touch.motion(
+        &mut state,
+        Some((target.clone(), origin)),
+        &motion_event(0, moved),
+    );
     touch.frame(&mut state);
 
     assert_eq!(
@@ -391,10 +594,168 @@ fn grab_origin_refresh_is_a_noop_without_a_grab() {
         called = true;
         None
     });
-    assert!(!called, "no grab means no pinned origin, so the callback never runs");
+    assert!(
+        !called,
+        "no grab means no pinned origin, so the callback never runs"
+    );
 
     // And the handle is still usable afterwards.
     let location: Point<f64, Logical> = (10.0, 10.0).into();
-    touch.down(&mut state, Some((target, (0.0, 0.0).into())), &down_event(0, location));
+    touch.down(
+        &mut state,
+        Some((target, (0.0, 0.0).into())),
+        &down_event(0, location),
+    );
     touch.frame(&mut state);
+}
+
+#[test]
+fn delivered_record_tracks_down_and_forwarded_motion() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let origin: Point<f64, Logical> = (10.0, 20.0).into();
+    let down_location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.down(
+        &mut state,
+        Some((target.clone(), origin)),
+        &down_event(0, down_location),
+    );
+    assert_eq!(
+        delivered_for(&touch, 0),
+        Some((target.clone(), down_location - origin)),
+        "down records the same surface-local point handed to the target"
+    );
+    assert!(touch.has_pending_frame(), "a delivered down owes a frame");
+    touch.frame(&mut state);
+    assert!(!touch.has_pending_frame(), "frame clears the pending marker");
+
+    let motion_location: Point<f64, Logical> = (55.0, 95.0).into();
+    touch.motion(
+        &mut state,
+        Some((target.clone(), origin)),
+        &motion_event(0, motion_location),
+    );
+    assert_eq!(
+        delivered_for(&touch, 0),
+        Some((target, motion_location - origin)),
+        "a forwarded motion advances the record to the delivered point"
+    );
+}
+
+#[test]
+fn delivered_record_ignores_motion_dropped_by_a_grab() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let origin: Point<f64, Logical> = (10.0, 20.0).into();
+    let location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.set_grab(
+        &mut state,
+        DroppingMotionGrab {
+            start_data: GrabStartData {
+                focus: Some((target.clone(), origin)),
+                slot: Some(0).into(),
+                location,
+            },
+        },
+        SERIAL_COUNTER.next_serial(),
+    );
+    touch.down(
+        &mut state,
+        Some((target.clone(), origin)),
+        &down_event(0, location),
+    );
+    touch.frame(&mut state);
+    let delivered = delivered_for(&touch, 0);
+
+    touch.motion(
+        &mut state,
+        Some((target, origin)),
+        &motion_event(0, (80.0, 90.0).into()),
+    );
+    assert_eq!(
+        delivered_for(&touch, 0),
+        delivered,
+        "a grab that never reaches TouchInternal::motion must not advance delivered state"
+    );
+    assert!(
+        !touch.has_pending_frame(),
+        "a swallowed motion does not create a frame marker"
+    );
+}
+
+#[test]
+fn delivered_record_clears_when_up_consumes_the_live_focus() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.down(
+        &mut state,
+        Some((target, (10.0, 20.0).into())),
+        &down_event(0, location),
+    );
+    assert!(delivered_for(&touch, 0).is_some());
+    touch.up(&mut state, &up_event(0));
+    assert_eq!(delivered_for(&touch, 0), None);
+}
+
+#[test]
+fn delivered_record_clears_when_cancel_consumes_the_live_focus() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.down(
+        &mut state,
+        Some((target, (10.0, 20.0).into())),
+        &down_event(0, location),
+    );
+    assert!(delivered_for(&touch, 0).is_some());
+    touch.cancel(&mut state);
+    assert_eq!(delivered_for(&touch, 0), None);
+}
+
+#[test]
+fn forget_slot_delivery_clears_a_grab_bypassed_slot() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.down(
+        &mut state,
+        Some((target, (10.0, 20.0).into())),
+        &down_event(0, location),
+    );
+    assert!(delivered_for(&touch, 0).is_some());
+    touch.forget_slot_delivery(Some(0).into());
+    assert_eq!(delivered_for(&touch, 0), None);
+}
+
+#[test]
+fn reused_slot_starts_without_the_previous_fingers_delivery() {
+    let (mut state, mut seat, _recorder, target) = setup();
+    let touch = seat.add_touch();
+    let slot = TouchSlot::from(Some(0));
+    let location: Point<f64, Logical> = (40.0, 70.0).into();
+
+    touch.down(
+        &mut state,
+        Some((target, (10.0, 20.0).into())),
+        &down_event(0, location),
+    );
+    assert!(delivered_for(&touch, 0).is_some());
+
+    // Model a compositor grab swallowing the old finger's up: its live focus is gone, but
+    // TouchInternal never got the lifecycle event that would normally clear `delivered`.
+    touch.inner.lock().unwrap().focus.get_mut(&slot).unwrap().focus = None;
+    touch.unset_grab(&mut state);
+    touch.down(&mut state, None, &down_event(0, (80.0, 90.0).into()));
+
+    assert_eq!(
+        delivered_for(&touch, 0),
+        None,
+        "down resets a reused slot even when the new finger resolves no focus"
+    );
 }

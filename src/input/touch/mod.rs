@@ -111,6 +111,7 @@ impl<D: SeatHandler> Drop for TouchInternal<D> {
 
 struct TouchSlotState<D: SeatHandler> {
     focus: Option<(<D as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
+    delivered: Option<(<D as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
     frame_pending: Option<<D as SeatHandler>::TouchFocus>,
     pending: FrameMarker,
     current: Option<FrameMarker>,
@@ -120,6 +121,7 @@ impl<D: SeatHandler> fmt::Debug for TouchSlotState<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TouchSlotState")
             .field("focus", &self.focus)
+            .field("delivered", &self.delivered)
             .field("frame_pending", &self.frame_pending)
             .field("pending", &self.pending)
             .field("current", &self.current)
@@ -421,6 +423,23 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         inner.cancel_all(data, &seat);
     }
 
+    /// Forget the last event actually delivered for a touch slot.
+    ///
+    /// Compositor-side grabs can consume an `up` or a reused-slot `down` without reaching
+    /// [`TouchInternal`]. Call this when the compositor drops the slot from its own live-slot
+    /// bookkeeping so a later event cannot be compared against the previous finger's delivery.
+    pub fn forget_slot_delivery(&self, slot: TouchSlot) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.focus.get_mut(&slot) {
+            state.delivered = None;
+        }
+    }
+
+    /// Whether one or more delivered touch events still owe a frame.
+    pub fn has_pending_frame(&self) -> bool {
+        self.inner.lock().unwrap().pending_frame.is_some()
+    }
+
     /// Notify that a touch point has changed its shape.
     pub fn shape(&self, data: &mut D, event: &ShapeEvent) {
         let mut inner = self.inner.lock().unwrap();
@@ -447,21 +466,28 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
     /// scrolled view), an origin baked at the down is wrong once the view moves or the
     /// finger travels, so it has to be recomputed at the slot's current location.
     ///
-    /// `f` is handed each live slot and its pinned target, and returns that target's origin
-    /// at that slot's location, or [`None`] to leave the stored origin alone. Slot-specific
-    /// by construction: two fingers on the same target under a zoomed view resolve
-    /// different origins.
+    /// `f` is handed each live slot, its pinned target, the currently stored origin, and
+    /// the target plus surface-local point of the last event this slot actually delivered.
+    /// It returns the target's new origin at that slot's location, or [`None`] to leave the
+    /// stored origin alone. Slot-specific by construction: two fingers on the same target
+    /// under a zoomed view resolve different origins.
     ///
     /// Call this immediately before dispatching. It takes the inner mutex briefly and
     /// dispatches nothing.
     pub fn with_slot_origins<F>(&self, mut f: F)
     where
-        F: FnMut(TouchSlot, &<D as SeatHandler>::TouchFocus) -> Option<Point<f64, Logical>>,
+        F: FnMut(
+            TouchSlot,
+            &<D as SeatHandler>::TouchFocus,
+            Point<f64, Logical>,
+            Option<&(<D as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
+        ) -> Option<Point<f64, Logical>>,
     {
         let mut inner = self.inner.lock().unwrap();
         for (slot, state) in inner.focus.iter_mut() {
-            if let Some((target, origin)) = state.focus.as_mut() {
-                if let Some(new_origin) = f(*slot, target) {
+            let TouchSlotState { focus, delivered, .. } = state;
+            if let Some((target, origin)) = focus.as_mut() {
+                if let Some(new_origin) = f(*slot, target, *origin, delivered.as_ref()) {
                     *origin = new_origin;
                 }
             }
@@ -663,19 +689,23 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
                 state.pending = marker;
                 state.frame_pending = None;
                 state.focus.clone_from(&focus);
+                state.delivered = None;
             })
             .or_insert_with(|| TouchSlotState {
                 focus,
+                delivered: None,
                 frame_pending: None,
                 pending: marker,
                 current: None,
             });
 
-        let state = self.focus.get(&event.slot).unwrap();
+        let state = self.focus.get_mut(&event.slot).unwrap();
         if let Some((focus, loc)) = state.focus.as_ref() {
             let mut new_event = event.clone();
             new_event.location -= *loc;
+            let delivered = (focus.clone(), new_event.location);
             focus.down(seat, data, &new_event);
+            state.delivered = Some(delivered);
         }
     }
 
@@ -686,6 +716,7 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         };
         state.pending = marker;
         if let Some((focus, _)) = state.focus.take() {
+            state.delivered = None;
             focus.up(seat, data, event);
 
             // Keep the focus around to be able to send a frame event after up, but move
@@ -709,7 +740,9 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         if let Some((focus, loc)) = state.focus.as_ref() {
             let mut new_event = event.clone();
             new_event.location -= *loc;
+            let delivered = (focus.clone(), new_event.location);
             focus.motion(seat, data, &new_event);
+            state.delivered = Some(delivered);
         }
     }
 
@@ -756,6 +789,7 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
             state.current = Some(marker);
 
             if let Some((focus, _)) = state.focus.take() {
+                state.delivered = None;
                 if focus.last_frame(seat, data) != Some(marker) {
                     focus.cancel(seat, data, marker);
                 }
@@ -774,6 +808,7 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         // active points at once, so `last_frame` keeps it to one per underlying target.
         for state in self.focus.values_mut() {
             if let Some((focus, _)) = state.focus.take() {
+                state.delivered = None;
                 if focus.last_frame(seat, data) != Some(marker) {
                     focus.cancel(seat, data, marker);
                 }

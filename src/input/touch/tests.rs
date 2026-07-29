@@ -641,6 +641,10 @@ fn delivered_record_tracks_down_and_forwarded_motion() {
         Some((target, motion_location - origin)),
         "a forwarded motion advances the record to the delivered point"
     );
+    assert!(
+        touch.has_pending_frame(),
+        "a forwarded motion sets the pending frame marker"
+    );
 }
 
 #[test]

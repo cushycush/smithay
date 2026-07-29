@@ -619,7 +619,9 @@ impl<D: SeatHandler + 'static> TouchInnerHandle<'_, D> {
     ///
     /// This needs to be called after one or move calls to [`TouchHandle::down`] or [`TouchHandle::motion`]
     pub fn frame(&mut self, data: &mut D) {
-        self.inner.frame(data, self.seat)
+        if self.inner.pending_frame.is_some() {
+            self.inner.frame(data, self.seat)
+        }
     }
 
     /// Notify that a touch point has changed its shape.

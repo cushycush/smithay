@@ -435,7 +435,7 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         }
     }
 
-    /// Whether one or more delivered touch events still owe a frame.
+    /// Whether one or more attempted touch events still owe a frame.
     pub fn has_pending_frame(&self) -> bool {
         self.inner.lock().unwrap().pending_frame.is_some()
     }

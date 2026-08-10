@@ -1087,6 +1087,10 @@ where
     previous_element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_opaque_regions_workhouse: Vec<Rectangle<i32, Physical>>,
+    /// Reused across frames so the effect scan allocates nothing in steady state.
+    /// Cleared and refilled at the top of every `render_frame`, so it carries no
+    /// state between frames; only its capacity survives.
+    framebuffer_effect_regions_workhouse: Vec<(usize, Rectangle<i32, Physical>)>,
 
     debug_flags: DebugFlags,
     span: tracing::Span,
@@ -1143,6 +1147,104 @@ where
             .map(|frame| frame.presentation_mode)
             .unwrap_or(PresentationMode::Vsync)
     }
+}
+
+/// Collect the framebuffer-effect elements of a frame into `out`, paired with the
+/// geometry each one samples, in the order given.
+///
+/// Split out from its call site so a test can drive it directly: the ordering and
+/// the filter are the whole rule, and a `position`/`rposition`-shaped mistake here
+/// would keep only one effect and let everything between two stacked effects
+/// through.
+///
+/// Fills a caller-owned buffer rather than returning a fresh collection: the caller
+/// keeps the `Vec` across frames and its capacity settles, so this scan costs no
+/// allocation in steady state. Returning a `SmallVec` instead was a per-frame heap
+/// allocation as soon as three effects were on screen. That is one fewer per-frame
+/// allocation and matches `element_opaque_regions_workhouse` beside it; it does not
+/// on its own make the whole of `render_frame` allocation-free, which still builds
+/// several sized collections per frame.
+///
+/// A module-level free function, deliberately not an associated function on
+/// [`DrmCompositor`]: nothing here mentions `Self` or any of the four generic
+/// parameters, and reaching it through `Self::` would force a test to name a
+/// concrete instantiation satisfying every bound on that impl just to pass a
+/// `usize` and two rectangles. The path of least resistance at that point is to
+/// re-implement the rule inside the test, which is exactly what splitting it out
+/// is meant to prevent.
+fn collect_framebuffer_effect_regions(
+    out: &mut Vec<(usize, Rectangle<i32, Physical>)>,
+    elements: impl IntoIterator<Item = (bool, Rectangle<i32, Physical>)>,
+) {
+    out.clear();
+    out.extend(
+        elements
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (is_effect, _))| *is_effect)
+            .map(|(index, (_, geometry))| (index, geometry)),
+    );
+}
+
+/// Whether the element at `index` sits BELOW a framebuffer effect it overlaps.
+///
+/// `elements` for a frame are ordered front-to-back (see [`DrmCompositor::render_frame`]),
+/// so an element sits below another exactly when its index is greater. Such an
+/// element must be composited into the primary framebuffer over the part it shares
+/// with the effect, because that framebuffer is what the effect samples: a plane
+/// assignment would replace it with a hole punch (underlay) or with hardware
+/// composition above the primary plane (overlay, cursor), and either way the effect
+/// reads pixels that are not there.
+///
+/// The region is the effect's element geometry, the same region
+/// [`OutputDamageTracker`] calls "behind the element" when it decides what a
+/// framebuffer effect must have available to capture.
+///
+/// `>` and not `>=`: the effect element passes its own barrier here and is refused
+/// just below, by the `is_framebuffer_effect` early-out in
+/// [`DrmCompositor::try_assign_element`]. The two are one rule.
+///
+/// `overlaps` and not `overlaps_or_touches`: an edge-adjacent element contributes
+/// no pixels inside the effect's region. Note this is adjacency and not area, since
+/// `overlaps` is true for a zero-area rectangle strictly inside another, so
+/// degenerate geometry is suppressed rather than exempted. That errs toward
+/// compositing, which is the safe direction.
+///
+/// This does not close the boundary in general, and `overlaps_or_touches` would not
+/// either. The region here IS the element geometry, so a consumer whose capture
+/// reaches outside its own geometry is outside what any geometry-keyed rule can
+/// promise. Drift's is bounded to a sub-pixel row under fractional radius and
+/// fractional output scale; see its renderer-gles trap notes.
+///
+/// Note for anyone adding a scanout-candidate heuristic: a candidate ordered BELOW
+/// a framebuffer effect it overlaps will never be promoted, by design. Buying that
+/// back needs the effect to declare its sampled region rather than inheriting its
+/// geometry.
+///
+/// A candidate ABOVE an effect it overlaps is untouched by this rule, and does not
+/// endanger that effect: the effect is BELOW the candidate, so what it samples is
+/// what sits behind itself, which the candidate is not. The case that would hurt is
+/// the other one, an effect above a promoted candidate it overlaps, and that is
+/// exactly what this function refuses. Captures are safe for a second reason too:
+/// `capture_framebuffer` runs inline just before its own element draws, while a hole
+/// punch draws last, so it can never poison a capture.
+///
+/// Promotion is still not free, but for an ordinary underlay reason rather than an
+/// effect one. Only an UNDERLAY assignment produces a `HolepunchRenderElement` (an
+/// overlay gets an `OverlayPlaneElement`), and that hole punch is inserted at the
+/// FRONT of the render list, so it draws last and clears its rect over whatever
+/// non-effect primary-plane elements were painted above the promoted candidate.
+/// That is upstream underlay behaviour, unchanged here.
+fn below_framebuffer_effect(
+    index: usize,
+    geometry: Rectangle<i32, Physical>,
+    effect_regions: &[(usize, Rectangle<i32, Physical>)],
+) -> bool {
+    effect_regions
+        .iter()
+        .any(|(effect_index, effect_geometry)| {
+            index > *effect_index && effect_geometry.overlaps(geometry)
+        })
 }
 
 impl<A, F, U, G> DrmCompositor<A, F, U, G>
@@ -1327,6 +1429,7 @@ where
                         previous_element_states: IndexMap::new(),
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
+                        framebuffer_effect_regions_workhouse: Vec::new(),
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -1510,6 +1613,7 @@ where
             previous_element_states: IndexMap::new(),
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
+            framebuffer_effect_regions_workhouse: Vec::new(),
             supports_fencing,
             debug_flags: DebugFlags::empty(),
             span,
@@ -2039,6 +2143,22 @@ where
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
 
+        // DRIFT-1427: the framebuffer effects of this frame and the region each one
+        // samples. `output_elements` is front-to-back, so everything after an entry
+        // here is below that effect. Computed BEFORE the assignment loop opens, not
+        // accumulated inside it: there is then no ordering between "observe the
+        // effect" and "decide about this element" for a later edit to get wrong, and
+        // no state that could outlive the frame.
+        // Taken and put back like `element_opaque_regions_workhouse` above, so the scan
+        // reuses one buffer across frames rather than allocating a fresh one per frame.
+        let mut effect_regions = std::mem::take(&mut self.framebuffer_effect_regions_workhouse);
+        collect_framebuffer_effect_regions(
+            &mut effect_regions,
+            output_elements
+                .iter()
+                .map(|(element, geometry, ..)| (element.is_framebuffer_effect(), *geometry)),
+        );
+
         let output_elements_len = output_elements.len();
         for (index, (element, element_geometry, element_visible_area, element_is_opaque)) in
             output_elements.iter().enumerate()
@@ -2082,6 +2202,7 @@ where
                 element_is_opaque,
                 &mut element_states,
                 &primary_plane_elements,
+                &effect_regions,
                 output_scale,
                 &mut next_frame_state,
                 output_transform,
@@ -2122,6 +2243,8 @@ where
                 }
             }
         }
+        // Put the scan buffer back so the next frame reuses its capacity.
+        self.framebuffer_effect_regions_workhouse = effect_regions;
 
         // Cleanup old state (e.g. old dmabuffers)
         for element_state in element_states.values_mut() {
@@ -2909,6 +3032,7 @@ where
         element_is_opaque: bool,
         element_states: &mut IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
         primary_plane_elements: &[&'a E],
+        effect_regions: &[(usize, Rectangle<i32, Physical>)],
         scale: Scale<f64>,
         frame_state: &mut CompositorFrameState<A, F>,
         output_transform: Transform,
@@ -2929,6 +3053,15 @@ where
             return Err(None);
         };
         if element.is_framebuffer_effect() {
+            return Err(None);
+        }
+        // DRIFT-1427: and neither may anything below one it overlaps, or the effect
+        // samples a hole punch instead of the content. Same rule, other half.
+        if below_framebuffer_effect(element_zindex, element_geometry, effect_regions) {
+            trace!(
+                "skipping direct scan-out for element {:?}, it is below a framebuffer effect it overlaps",
+                element.id()
+            );
             return Err(None);
         }
 
@@ -4528,4 +4661,174 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+/// DRIFT-1427. An element below a framebuffer effect it overlaps must be composited
+/// into the primary framebuffer, because that framebuffer is what the effect samples.
+///
+/// These drive the two halves the way `render_frame` drives them, rather than
+/// restating them: the scan is the function production calls, and the composed cases
+/// walk a whole ordered stack. The remaining untested surface is the one `map`
+/// closure that adapts `output_elements` and the threading of the result into
+/// `try_assign_element`, which cannot be reached without a live `DrmSurface`,
+/// allocator and plane set. Faking one would be a fake.
+#[cfg(test)]
+mod framebuffer_effect_barrier_tests {
+    use super::{below_framebuffer_effect, collect_framebuffer_effect_regions};
+    use crate::utils::{Physical, Point, Rectangle, Size};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+    }
+
+    /// The whole screen, so a stack built from it overlaps everywhere.
+    fn full() -> Rectangle<i32, Physical> {
+        rect(0, 0, 100, 100)
+    }
+
+    /// Drive the production scan the way `render_frame` does, into a caller-owned
+    /// buffer, and hand back what it filled.
+    fn scan(
+        elements: impl IntoIterator<Item = (bool, Rectangle<i32, Physical>)>,
+    ) -> Vec<(usize, Rectangle<i32, Physical>)> {
+        let mut out = Vec::new();
+        collect_framebuffer_effect_regions(&mut out, elements);
+        out
+    }
+
+    #[test]
+    fn the_scan_keeps_every_effect_in_front_to_back_order() {
+        let ordinary = rect(0, 0, 10, 10);
+        let effect = rect(1, 1, 20, 20);
+
+        assert_eq!(
+            scan([(false, ordinary), (true, effect), (false, ordinary)]),
+            [(1, effect)],
+            "the single effect is kept at its own index",
+        );
+        assert!(
+            scan([(false, ordinary), (false, ordinary)]).is_empty(),
+            "no effect on screen must never suppress anything",
+        );
+        assert_eq!(
+            scan([(true, effect), (false, ordinary), (false, ordinary)]),
+            [(0, effect)],
+        );
+        // The discriminator: keeping only the front-most (`position`) or only the
+        // rear-most (`rposition`) would let the element BETWEEN two stacked effects
+        // through, because it is below one of them.
+        let lower_effect = rect(2, 2, 30, 30);
+        assert_eq!(
+            scan([(true, effect), (false, ordinary), (true, lower_effect)]),
+            [(0, effect), (2, lower_effect)],
+            "both stacked effects are kept, not just one",
+        );
+    }
+
+    #[test]
+    fn the_scan_refills_the_callers_buffer_and_never_replaces_it() {
+        // The point of taking `&mut Vec` is that the CALLER's allocation survives, so
+        // a steady frame does not allocate. Seed a capacity far above what the data
+        // needs and assert it is still there afterwards: a body that reassigned
+        // (`*out = ...collect()`) would drop it to the collection's own capacity, and
+        // would otherwise pass every assertion here, since a two-element fill and a
+        // fresh collect both land on the same small capacity.
+        let effect = full();
+        let stack = [(false, full()), (true, effect), (true, effect)];
+        let mut buffer = Vec::with_capacity(64);
+        let seeded = buffer.capacity();
+        assert!(seeded >= 64, "the seed must exceed what the fill needs");
+
+        for _ in 0..8 {
+            collect_framebuffer_effect_regions(&mut buffer, stack);
+            assert_eq!(buffer.len(), 2, "each pass refills from scratch");
+            assert_eq!(
+                buffer.capacity(),
+                seeded,
+                "the caller's allocation must be reused, not replaced",
+            );
+        }
+
+        // And a frame with no effects empties it rather than leaving the last one.
+        collect_framebuffer_effect_regions(&mut buffer, [(false, full())]);
+        assert!(buffer.is_empty(), "the buffer carries no state between frames");
+        assert_eq!(buffer.capacity(), seeded, "emptying must not drop the allocation");
+    }
+
+    #[test]
+    fn below_is_a_greater_index_and_an_overlap() {
+        let effect = full();
+        let regions = [(1usize, effect)];
+
+        assert!(
+            below_framebuffer_effect(2, full(), &regions),
+            "an element after the effect is below it",
+        );
+        assert!(
+            !below_framebuffer_effect(0, full(), &regions),
+            "an element before the effect is above it",
+        );
+        assert!(
+            !below_framebuffer_effect(1, full(), &regions),
+            "the effect's own index is not below itself; it is refused one line earlier",
+        );
+        assert!(
+            !below_framebuffer_effect(2, full(), &[]),
+            "with no effect on screen nothing is below one",
+        );
+    }
+
+    #[test]
+    fn a_lower_element_clear_of_the_effect_is_left_alone() {
+        let regions = [(0usize, rect(0, 0, 10, 10))];
+
+        assert!(
+            !below_framebuffer_effect(1, rect(50, 50, 10, 10), &regions),
+            "a lower element that does not overlap the effect is not sampled by it",
+        );
+        assert!(
+            !below_framebuffer_effect(1, rect(10, 0, 10, 10), &regions),
+            "edge-adjacent contributes no pixels inside the effect's region",
+        );
+        assert!(
+            below_framebuffer_effect(1, rect(9, 0, 10, 10), &regions),
+            "one column of genuine overlap is enough",
+        );
+    }
+
+    #[test]
+    fn the_two_composed_answer_the_ticket() {
+        // The ticket's sentence: a lower element that would otherwise be scanned out
+        // is composited when an active backdrop sits above it.
+        let stack = [(false, full()), (true, full()), (false, full())];
+        let regions = scan(stack);
+        let verdicts: Vec<bool> = stack
+            .iter()
+            .enumerate()
+            .map(|(index, (_, geometry))| below_framebuffer_effect(index, *geometry, &regions))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![false, false, true],
+            "only the element below the effect is refused a plane",
+        );
+
+        // Same stack, bottom element moved clear of the effect.
+        let clear = [
+            (false, full()),
+            (true, rect(0, 0, 10, 10)),
+            (false, rect(50, 50, 10, 10)),
+        ];
+        let regions = scan(clear);
+        let verdicts: Vec<bool> = clear
+            .iter()
+            .enumerate()
+            .map(|(index, (_, geometry))| below_framebuffer_effect(index, *geometry, &regions))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![false, false, false],
+            "a lower element clear of the effect keeps its plane",
+        );
+    }
 }

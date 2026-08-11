@@ -1033,14 +1033,15 @@ impl LegacyCursorState {
     }
 
     fn invalidate(&mut self, policy: CursorPlanePolicy) {
-        self.ownership = if policy.reserves_legacy_cursor() {
-            LegacyCursorOwnership::Candidate
-        } else {
-            LegacyCursorOwnership::Atomic
-        };
-        self.legacy_succeeded = false;
+        if !policy.reserves_legacy_cursor() {
+            self.ownership = LegacyCursorOwnership::Atomic;
+            self.legacy_succeeded = false;
+        }
         self.fast_motion_permanently_rejected = false;
-        self.next_token = self.next_token.wrapping_add(1).max(1);
+        let token = self.token();
+        if let LegacyCursorOwnership::Active(active) = &mut self.ownership {
+            active.presentation.token = token;
+        }
     }
 
     fn token(&mut self) -> LegacyCursorToken {
@@ -1347,10 +1348,33 @@ where
             .unwrap_or(PresentationMode::Vsync)
     }
 
-    /// Invalidate tokens and retained cursor buffers across a DRM lifecycle boundary.
+    /// Disable the legacy cursor and retire its move token across a DRM lifecycle boundary.
     pub fn invalidate_legacy_cursor_lifecycle(&mut self) {
+        self.disable_legacy_cursor();
         if let Some(cursor_state) = self.cursor_state.as_mut() {
             cursor_state.legacy.invalidate(self.cursor_plane_policy);
+        }
+    }
+
+    #[allow(deprecated)]
+    fn disable_legacy_cursor(&mut self) -> Option<LegacyCursorPresentation> {
+        let active = match self.cursor_state.as_ref().map(|state| &state.legacy.ownership) {
+            Some(LegacyCursorOwnership::Active(active)) => active.presentation.clone(),
+            _ => return None,
+        };
+        match self
+            .surface
+            .device_fd()
+            .set_cursor2::<GbmBuffer>(self.surface.crtc(), None, (0, 0))
+        {
+            Ok(()) => {
+                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Disabled;
+                None
+            }
+            Err(error) => {
+                debug!(?error, "failed to disable legacy cursor");
+                Some(active)
+            }
         }
     }
 
@@ -3219,7 +3243,6 @@ where
 
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
-        self.disable_legacy_cursor();
         self.invalidate_legacy_cursor_lifecycle();
         self.swapchain.reset_buffers();
     }
@@ -3310,7 +3333,6 @@ where
     /// [`crtc`] or any of the
     /// pending [`connector`]s.
     pub fn use_mode(&mut self, mode: Mode) -> FrameResult<(), A, F> {
-        self.disable_legacy_cursor();
         self.invalidate_legacy_cursor_lifecycle();
         self.surface.use_mode(mode).map_err(FrameError::DrmError)?;
         let (w, h) = mode.size();
@@ -3402,7 +3424,6 @@ where
             return;
         }
 
-        self.disable_legacy_cursor();
         self.damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         self.output_mode_source = output_mode_source;
         self.invalidate_legacy_cursor_lifecycle();
@@ -3419,28 +3440,6 @@ where
         }
         if let Some(frame) = self.next_frame.as_mut() {
             frame.frame.add_cursor_planes(&self.planes);
-        }
-    }
-
-    #[allow(deprecated)]
-    fn disable_legacy_cursor(&mut self) -> Option<LegacyCursorPresentation> {
-        let active = match self.cursor_state.as_ref().map(|state| &state.legacy.ownership) {
-            Some(LegacyCursorOwnership::Active(active)) => active.presentation.clone(),
-            _ => return None,
-        };
-        match self
-            .surface
-            .device_fd()
-            .set_cursor2::<GbmBuffer>(self.surface.crtc(), None, (0, 0))
-        {
-            Ok(()) => {
-                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Disabled;
-                None
-            }
-            Err(error) => {
-                debug!(?error, "failed to disable legacy cursor");
-                Some(active)
-            }
         }
     }
 
@@ -4861,7 +4860,6 @@ where
     ///
     /// Calling [`queue_frame`][Self::queue_frame] will re-enable.
     pub fn clear(&mut self) -> Result<(), DrmError> {
-        self.disable_legacy_cursor();
         self.invalidate_legacy_cursor_lifecycle();
         self.surface.clear()?;
 
@@ -5340,8 +5338,8 @@ mod legacy_cursor_tests {
     use std::cell::RefCell;
 
     use super::{
-        FrameFlags, LegacyCursorInstallResult, LegacyCursorIo, cursor_plane_location,
-        install_legacy_cursor,
+        CursorPlanePolicy, FrameFlags, LegacyCursorInstallResult, LegacyCursorIo, LegacyCursorOwnership,
+        LegacyCursorState, cursor_plane_location, install_legacy_cursor,
     };
     use crate::utils::{Physical, Point, Rectangle, Size, Transform};
 
@@ -5464,6 +5462,25 @@ mod legacy_cursor_tests {
         );
         assert!(FrameFlags::DEFAULT.contains(FrameFlags::ALLOW_LEGACY_CURSOR));
         assert!(!FrameFlags::empty().contains(FrameFlags::ALLOW_LEGACY_CURSOR));
+    }
+
+    #[test]
+    fn lifecycle_invalidation_preserves_reserved_ownership_history() {
+        let mut candidate = LegacyCursorState::new(CursorPlanePolicy::ReserveForLegacy);
+        candidate.invalidate(CursorPlanePolicy::ReserveForLegacy);
+        assert!(matches!(candidate.ownership, LegacyCursorOwnership::Candidate));
+
+        let mut disabled = LegacyCursorState::new(CursorPlanePolicy::ReserveForLegacy);
+        disabled.legacy_succeeded = true;
+        disabled.ownership = LegacyCursorOwnership::Disabled;
+        disabled.invalidate(CursorPlanePolicy::ReserveForLegacy);
+        assert!(matches!(disabled.ownership, LegacyCursorOwnership::Disabled));
+        assert!(disabled.legacy_succeeded);
+
+        let mut atomic = LegacyCursorState::new(CursorPlanePolicy::ReserveForLegacy);
+        atomic.ownership = LegacyCursorOwnership::Atomic;
+        atomic.invalidate(CursorPlanePolicy::ReserveForLegacy);
+        assert!(matches!(atomic.ownership, LegacyCursorOwnership::Atomic));
     }
 }
 

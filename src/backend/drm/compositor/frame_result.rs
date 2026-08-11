@@ -52,6 +52,8 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     pub cursor_element: Option<&'a E>,
     /// Cursor presented through legacy cursor ioctls, outside atomic plane state.
     pub legacy_cursor: Option<LegacyCursorPresentation>,
+    /// Whether this render changed legacy cursor hardware state without relying on an atomic frame.
+    pub legacy_cursor_changed: bool,
 
     pub(super) primary_plane_element_id: Id,
     pub(super) supports_fencing: bool,

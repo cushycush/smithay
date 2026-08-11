@@ -905,9 +905,29 @@ enum LegacyCursorOwnership {
 }
 
 enum LegacyCursorAssignment {
-    Presented(LegacyCursorPresentation),
-    Software,
+    Presented {
+        presentation: LegacyCursorPresentation,
+        changed: bool,
+    },
+    Software {
+        changed: bool,
+    },
     Atomic,
+}
+
+enum LegacyCursorDisableResult {
+    Inactive,
+    Disabled,
+    Retained(LegacyCursorPresentation),
+}
+
+/// Result of retiring a legacy cursor across a DRM lifecycle boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyCursorLifecycleResult {
+    /// The cursor was inactive or was disabled successfully.
+    Invalidated,
+    /// Disabling failed, so the old cursor buffer remains retained and its move token was retired.
+    Retained,
 }
 
 trait LegacyCursorIo<B> {
@@ -1016,7 +1036,11 @@ struct LegacyCursorState {
     next_token: u64,
     legacy_succeeded: bool,
     fast_motion_permanently_rejected: bool,
+    setup_failures: u8,
+    setup_retry_exhausted: bool,
 }
+
+const MAX_LEGACY_CURSOR_SETUP_FAILURES: u8 = 3;
 
 impl LegacyCursorState {
     fn new(policy: CursorPlanePolicy) -> Self {
@@ -1029,6 +1053,8 @@ impl LegacyCursorState {
             next_token: 1,
             legacy_succeeded: false,
             fast_motion_permanently_rejected: false,
+            setup_failures: 0,
+            setup_retry_exhausted: false,
         }
     }
 
@@ -1038,6 +1064,8 @@ impl LegacyCursorState {
             self.legacy_succeeded = false;
         }
         self.fast_motion_permanently_rejected = false;
+        self.setup_failures = 0;
+        self.setup_retry_exhausted = false;
         let token = self.token();
         if let LegacyCursorOwnership::Active(active) = &mut self.ownership {
             active.presentation.token = token;
@@ -1048,6 +1076,16 @@ impl LegacyCursorState {
         let token = LegacyCursorToken(self.next_token);
         self.next_token = self.next_token.wrapping_add(1).max(1);
         token
+    }
+
+    fn setup_failed(&mut self) {
+        self.setup_failures = self.setup_failures.saturating_add(1);
+        self.setup_retry_exhausted = self.setup_failures >= MAX_LEGACY_CURSOR_SETUP_FAILURES;
+    }
+
+    fn setup_succeeded(&mut self) {
+        self.setup_failures = 0;
+        self.setup_retry_exhausted = false;
     }
 }
 
@@ -1349,18 +1387,26 @@ where
     }
 
     /// Disable the legacy cursor and retire its move token across a DRM lifecycle boundary.
-    pub fn invalidate_legacy_cursor_lifecycle(&mut self) {
-        self.disable_legacy_cursor();
+    pub fn invalidate_legacy_cursor_lifecycle(&mut self) -> LegacyCursorLifecycleResult {
+        let retained = matches!(
+            self.disable_legacy_cursor(),
+            LegacyCursorDisableResult::Retained(_)
+        );
         if let Some(cursor_state) = self.cursor_state.as_mut() {
             cursor_state.legacy.invalidate(self.cursor_plane_policy);
+        }
+        if retained {
+            LegacyCursorLifecycleResult::Retained
+        } else {
+            LegacyCursorLifecycleResult::Invalidated
         }
     }
 
     #[allow(deprecated)]
-    fn disable_legacy_cursor(&mut self) -> Option<LegacyCursorPresentation> {
+    fn disable_legacy_cursor(&mut self) -> LegacyCursorDisableResult {
         let active = match self.cursor_state.as_ref().map(|state| &state.legacy.ownership) {
             Some(LegacyCursorOwnership::Active(active)) => active.presentation.clone(),
-            _ => return None,
+            _ => return LegacyCursorDisableResult::Inactive,
         };
         match self
             .surface
@@ -1369,11 +1415,11 @@ where
         {
             Ok(()) => {
                 self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Disabled;
-                None
+                LegacyCursorDisableResult::Disabled
             }
             Err(error) => {
                 debug!(?error, "failed to disable legacy cursor");
-                Some(active)
+                LegacyCursorDisableResult::Retained(active)
             }
         }
     }
@@ -2491,6 +2537,7 @@ where
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
         let mut legacy_cursor: Option<LegacyCursorPresentation> = None;
+        let mut legacy_cursor_changed = false;
 
         // DRIFT-1427: the framebuffer effects of this frame and the region each one
         // samples. `output_elements` is front-to-back, so everything after an entry
@@ -2519,14 +2566,18 @@ where
         {
             Some(legacy_cursor_candidates[0])
         } else {
-            let retained = self.disable_legacy_cursor();
-            if let Some(presentation) = retained {
-                legacy_cursor = Some(presentation.clone());
-                output_elements
-                    .iter()
-                    .position(|(element, ..)| element.id() == &presentation.element_id)
-            } else {
-                None
+            match self.disable_legacy_cursor() {
+                LegacyCursorDisableResult::Inactive => None,
+                LegacyCursorDisableResult::Disabled => {
+                    legacy_cursor_changed = true;
+                    None
+                }
+                LegacyCursorDisableResult::Retained(presentation) => {
+                    legacy_cursor = Some(presentation.clone());
+                    output_elements
+                        .iter()
+                        .position(|(element, ..)| element.id() == &presentation.element_id)
+                }
             }
         };
 
@@ -2541,7 +2592,10 @@ where
 
             if legacy_cursor_index == Some(index) {
                 let assignment = if let Some(presentation) = legacy_cursor.as_ref() {
-                    LegacyCursorAssignment::Presented(presentation.clone())
+                    LegacyCursorAssignment::Presented {
+                        presentation: presentation.clone(),
+                        changed: false,
+                    }
                 } else {
                     self.try_assign_legacy_cursor(
                         renderer,
@@ -2553,7 +2607,11 @@ where
                     )
                 };
                 match assignment {
-                    LegacyCursorAssignment::Presented(presentation) => {
+                    LegacyCursorAssignment::Presented {
+                        presentation,
+                        changed,
+                    } => {
+                        legacy_cursor_changed |= changed;
                         render_element_states
                             .states
                             .entry(element_id.clone())
@@ -2568,7 +2626,9 @@ where
                     LegacyCursorAssignment::Atomic => {
                         next_frame_state.add_cursor_planes(&self.planes);
                     }
-                    LegacyCursorAssignment::Software => {}
+                    LegacyCursorAssignment::Software { changed } => {
+                        legacy_cursor_changed |= changed;
+                    }
                 }
             }
 
@@ -2996,6 +3056,7 @@ where
             overlay_elements: overlay_plane_elements.into_values().collect(),
             cursor_element: cursor_plane_element,
             legacy_cursor,
+            legacy_cursor_changed,
             states: render_element_states,
             primary_plane_element_id: self.primary_plane_element_id.clone(),
             supports_fencing: self.supports_fencing,
@@ -3459,7 +3520,7 @@ where
     {
         let element_size = output_transform.transform_size(element_geometry.size);
         if element_size.w > self.cursor_size.w || element_size.h > self.cursor_size.h {
-            return LegacyCursorAssignment::Software;
+            return LegacyCursorAssignment::Software { changed: false };
         }
         let physical_origin = cursor_plane_location(
             element.location(output_scale),
@@ -3469,10 +3530,16 @@ where
         );
 
         let Some(cursor_state) = self.cursor_state.as_ref() else {
-            return LegacyCursorAssignment::Software;
+            return LegacyCursorAssignment::Software { changed: false };
         };
         if matches!(cursor_state.legacy.ownership, LegacyCursorOwnership::Atomic) {
             return LegacyCursorAssignment::Atomic;
+        }
+        if self.planes.cursor.is_empty() || cursor_state.legacy.setup_retry_exhausted {
+            let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
+            legacy.ownership = LegacyCursorOwnership::Disabled;
+            legacy.setup_retry_exhausted = true;
+            return LegacyCursorAssignment::Software { changed: false };
         }
 
         let unchanged = match &cursor_state.legacy.ownership {
@@ -3491,13 +3558,19 @@ where
                 _ => unreachable!(),
             };
             if active.presentation.physical_origin == physical_origin {
-                return LegacyCursorAssignment::Presented(active.presentation.clone());
+                return LegacyCursorAssignment::Presented {
+                    presentation: active.presentation.clone(),
+                    changed: false,
+                };
             }
             let token = active.presentation.token;
             if let LegacyCursorMoveResult::Moved(presentation) =
                 self.move_legacy_cursor(token, physical_origin)
             {
-                return LegacyCursorAssignment::Presented(presentation);
+                return LegacyCursorAssignment::Presented {
+                    presentation,
+                    changed: true,
+                };
             }
         }
 
@@ -3517,7 +3590,7 @@ where
             )
         };
         let Some(cursor_buffer) = cursor_buffer else {
-            return LegacyCursorAssignment::Software;
+            return LegacyCursorAssignment::Software { changed: false };
         };
 
         let legacy_succeeded = self.cursor_state.as_ref().unwrap().legacy.legacy_succeeded;
@@ -3528,23 +3601,34 @@ where
             replacing_active,
             legacy_succeeded,
         ) {
-            LegacyCursorInstallResult::Installed => {}
+            LegacyCursorInstallResult::Installed => {
+                self.cursor_state.as_mut().unwrap().legacy.setup_succeeded();
+            }
             LegacyCursorInstallResult::PreserveActive => {
                 let active = match &self.cursor_state.as_ref().unwrap().legacy.ownership {
                     LegacyCursorOwnership::Active(active) => active,
                     _ => unreachable!(),
                 };
-                return LegacyCursorAssignment::Presented(active.presentation.clone());
+                return LegacyCursorAssignment::Presented {
+                    presentation: active.presentation.clone(),
+                    changed: false,
+                };
             }
             LegacyCursorInstallResult::DisabledSoftware => {
                 let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
                 legacy.legacy_succeeded = true;
                 legacy.ownership = LegacyCursorOwnership::Disabled;
-                return LegacyCursorAssignment::Software;
+                legacy.setup_failed();
+                return LegacyCursorAssignment::Software { changed: true };
             }
             LegacyCursorInstallResult::CandidateSoftware => {
-                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Candidate;
-                return LegacyCursorAssignment::Software;
+                let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
+                legacy.ownership = LegacyCursorOwnership::Candidate;
+                legacy.setup_failed();
+                if legacy.setup_retry_exhausted {
+                    legacy.ownership = LegacyCursorOwnership::Disabled;
+                }
+                return LegacyCursorAssignment::Software { changed: false };
             }
             LegacyCursorInstallResult::Atomic => {
                 self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Atomic;
@@ -3569,7 +3653,10 @@ where
             output_scale,
             output_transform,
         });
-        LegacyCursorAssignment::Presented(presentation)
+        LegacyCursorAssignment::Presented {
+            presentation,
+            changed: true,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5339,7 +5426,8 @@ mod legacy_cursor_tests {
 
     use super::{
         CursorPlanePolicy, FrameFlags, LegacyCursorInstallResult, LegacyCursorIo, LegacyCursorOwnership,
-        LegacyCursorState, cursor_plane_location, install_legacy_cursor,
+        LegacyCursorState, MAX_LEGACY_CURSOR_SETUP_FAILURES, cursor_plane_location,
+        install_legacy_cursor,
     };
     use crate::utils::{Physical, Point, Rectangle, Size, Transform};
 
@@ -5481,6 +5569,19 @@ mod legacy_cursor_tests {
         atomic.ownership = LegacyCursorOwnership::Atomic;
         atomic.invalidate(CursorPlanePolicy::ReserveForLegacy);
         assert!(matches!(atomic.ownership, LegacyCursorOwnership::Atomic));
+    }
+
+    #[test]
+    fn repeated_setup_failures_stop_until_a_lifecycle_reset() {
+        let mut legacy = LegacyCursorState::new(CursorPlanePolicy::ReserveForLegacy);
+        for _ in 0..MAX_LEGACY_CURSOR_SETUP_FAILURES {
+            legacy.setup_failed();
+        }
+        assert!(legacy.setup_retry_exhausted);
+
+        legacy.invalidate(CursorPlanePolicy::ReserveForLegacy);
+        assert!(!legacy.setup_retry_exhausted);
+        assert_eq!(legacy.setup_failures, 0);
     }
 }
 

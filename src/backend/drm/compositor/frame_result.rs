@@ -19,7 +19,7 @@ use crate::{
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 
-use super::{DrmScanoutBuffer, ScanoutBuffer};
+use super::{DrmScanoutBuffer, LegacyCursorPresentation, ScanoutBuffer};
 
 /// Result for [`DrmCompositor::render_frame`][super::DrmCompositor::render_frame]
 ///
@@ -50,6 +50,8 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     ///
     /// If set always above all other elements
     pub cursor_element: Option<&'a E>,
+    /// Cursor presented through legacy cursor ioctls, outside atomic plane state.
+    pub legacy_cursor: Option<LegacyCursorPresentation>,
 
     pub(super) primary_plane_element_id: Id,
     pub(super) supports_fencing: bool,
@@ -427,6 +429,7 @@ impl<B: Buffer + std::fmt::Debug, F: Framebuffer + std::fmt::Debug, E: std::fmt:
             .field("primary_element", &self.primary_element)
             .field("overlay_elements", &self.overlay_elements)
             .field("cursor_element", &self.cursor_element)
+            .field("legacy_cursor", &self.legacy_cursor)
             .finish()
     }
 }

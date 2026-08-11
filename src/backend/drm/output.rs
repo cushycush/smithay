@@ -21,13 +21,14 @@ use crate::{
         renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
     },
     output::OutputModeSource,
+    utils::{Physical, Point},
 };
 
 use super::{
     DrmDevice, DrmError, Planes, PresentationMode,
     compositor::{
-        DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
-        RenderFrameErrorType, RenderFrameResult,
+        DrmCompositor, FrameError, FrameFlags, FrameResult, LegacyCursorMoveResult, LegacyCursorToken,
+        PrimaryPlaneElement, RenderFrameError, RenderFrameErrorType, RenderFrameResult,
     },
     exporter::ExportFramebuffer,
 };
@@ -146,6 +147,9 @@ where
 
     /// Pause the underlying device. See [`DrmDevice::pause`].
     pub fn pause(&mut self) {
+        for compositor in self.compositor.write().unwrap().values_mut() {
+            compositor.get_mut().unwrap().invalidate_legacy_cursor_lifecycle();
+        }
         self.device.pause();
     }
 }
@@ -174,6 +178,9 @@ where
 
     /// Pause the underlying device. See [`DrmDevice::pause`].
     pub fn pause(&mut self) {
+        for compositor in self.compositor.values_mut() {
+            compositor.get_mut().unwrap().invalidate_legacy_cursor_lifecycle();
+        }
         self.device.pause();
     }
 }
@@ -337,7 +344,7 @@ where
                 let surface = self.device.create_surface(crtc, mode, connectors)?;
 
                 if implicit_modifiers {
-                    DrmCompositor::<A, F, U, G>::new(
+                    DrmCompositor::<A, F, U, G>::new_with_cursor_plane_policy(
                         output_mode_source.clone(),
                         surface,
                         planes.clone(),
@@ -350,9 +357,10 @@ where
                             .copied(),
                         self.device.cursor_size(),
                         self.gbm.clone(),
+                        self.device.cursor_plane_policy(),
                     )
                 } else {
-                    DrmCompositor::<A, F, U, G>::new(
+                    DrmCompositor::<A, F, U, G>::new_with_cursor_plane_policy(
                         output_mode_source.clone(),
                         surface,
                         planes.clone(),
@@ -362,6 +370,7 @@ where
                         self.renderer_formats.iter().copied(),
                         self.device.cursor_size(),
                         self.gbm.clone(),
+                        self.device.cursor_plane_policy(),
                     )
                 }
             };
@@ -671,6 +680,15 @@ where
         self.with_compositor(|compositor| compositor.reset_buffers());
     }
 
+    /// Move the installed legacy cursor without submitting an atomic frame.
+    pub fn move_legacy_cursor(
+        &self,
+        token: LegacyCursorToken,
+        physical_origin: Point<i32, Physical>,
+    ) -> LegacyCursorMoveResult {
+        self.with_compositor(|compositor| compositor.move_legacy_cursor(token, physical_origin))
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`]
@@ -832,6 +850,9 @@ where
 {
     fn drop(&mut self) {
         let mut write_guard = self.compositor.write().unwrap();
+        if let Some(compositor) = write_guard.get_mut(&self.crtc) {
+            compositor.get_mut().unwrap().invalidate_legacy_cursor_lifecycle();
+        }
         write_guard.remove(&self.crtc);
     }
 }

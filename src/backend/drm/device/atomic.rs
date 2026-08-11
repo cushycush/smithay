@@ -10,9 +10,12 @@ use drm::control::{
     framebuffer, plane, property,
 };
 
-use super::DrmDeviceFd;
+use super::{CursorPlanePolicy, DrmDeviceFd};
 use crate::backend::drm::error::AccessError;
-use crate::{backend::drm::error::Error, utils::DevPath};
+use crate::{
+    backend::drm::{error::Error, plane_type},
+    utils::DevPath,
+};
 
 use tracing::{debug, error, info_span, trace};
 
@@ -87,10 +90,16 @@ pub struct AtomicDrmDevice {
     old_state: OldState,
     pub(crate) prop_mapping: Arc<RwLock<PropMapping>>,
     pub(super) span: tracing::Span,
+    cursor_plane_policy: CursorPlanePolicy,
 }
 
 impl AtomicDrmDevice {
-    pub fn new(fd: DrmDeviceFd, active: Arc<AtomicBool>, disable_connectors: bool) -> Result<Self, Error> {
+    pub fn new(
+        fd: DrmDeviceFd,
+        active: Arc<AtomicBool>,
+        disable_connectors: bool,
+        cursor_plane_policy: CursorPlanePolicy,
+    ) -> Result<Self, Error> {
         let span = info_span!("drm_atomic");
         let mut dev = AtomicDrmDevice {
             fd,
@@ -98,6 +107,7 @@ impl AtomicDrmDevice {
             old_state: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             prop_mapping: Default::default(),
             span,
+            cursor_plane_policy,
         };
         let _guard = dev.span.enter();
 
@@ -126,7 +136,8 @@ impl AtomicDrmDevice {
         add_props(&dev.fd, res_handles.connectors(), &mut old_state.0)?;
         add_props(&dev.fd, res_handles.crtcs(), &mut old_state.1)?;
         add_props(&dev.fd, res_handles.framebuffers(), &mut old_state.2)?;
-        add_props(&dev.fd, &planes, &mut old_state.3)?;
+        let atomic_planes = atomic_plane_handles(&dev.fd, &planes, cursor_plane_policy)?;
+        add_props(&dev.fd, &atomic_planes, &mut old_state.3)?;
 
         // And because the mapping is not consistent across devices,
         // we also need to lookup the handle for a property name.
@@ -198,7 +209,7 @@ impl AtomicDrmDevice {
             req.add_property(*conn, prop, property::Value::CRTC(None));
         }
         // Disable all planes
-        for plane in plane_handles {
+        for plane in atomic_plane_handles(&self.fd, &plane_handles, self.cursor_plane_policy)? {
             let prop = prop_mapping
                 .plane_prop_handle(plane, "CRTC_ID")
                 .expect("Unknown property CRTC_ID");
@@ -232,6 +243,59 @@ impl AtomicDrmDevice {
             })?;
 
         Ok(())
+    }
+}
+
+fn atomic_plane_handles(
+    fd: &DrmDeviceFd,
+    planes: &[plane::Handle],
+    cursor_plane_policy: CursorPlanePolicy,
+) -> Result<Vec<plane::Handle>, Error> {
+    if !cursor_plane_policy.reserves_legacy_cursor() {
+        return Ok(planes.to_vec());
+    }
+
+    planes
+        .iter()
+        .copied()
+        .filter_map(|handle| match plane_type(fd, handle) {
+            Ok(type_) if !policy_includes_plane(cursor_plane_policy, type_) => None,
+            Ok(_) => Some(Ok(handle)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn policy_includes_plane(cursor_plane_policy: CursorPlanePolicy, type_: drm::control::PlaneType) -> bool {
+    !cursor_plane_policy.reserves_legacy_cursor() || type_ != drm::control::PlaneType::Cursor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CursorPlanePolicy, policy_includes_plane};
+    use drm::control::PlaneType;
+
+    #[test]
+    fn atomic_policy_keeps_every_plane_type() {
+        for type_ in [PlaneType::Primary, PlaneType::Overlay, PlaneType::Cursor] {
+            assert!(policy_includes_plane(CursorPlanePolicy::Atomic, type_));
+        }
+    }
+
+    #[test]
+    fn legacy_reservation_excludes_only_cursor_planes() {
+        assert!(policy_includes_plane(
+            CursorPlanePolicy::ReserveForLegacy,
+            PlaneType::Primary,
+        ));
+        assert!(policy_includes_plane(
+            CursorPlanePolicy::ReserveForLegacy,
+            PlaneType::Overlay,
+        ));
+        assert!(!policy_includes_plane(
+            CursorPlanePolicy::ReserveForLegacy,
+            PlaneType::Cursor,
+        ));
     }
 }
 

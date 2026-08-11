@@ -157,7 +157,7 @@ use crate::{
             format::{get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
-        drm::{DrmError, PlaneDamageClips, plane_has_property},
+        drm::{CursorPlanePolicy, DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
             Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
@@ -204,7 +204,6 @@ impl RenderElementState {
         }
     }
 }
-
 #[allow(dead_code)] // This structs purpose is to keep buffer objects alive, most variants won't be read
 #[derive(Debug)]
 enum ScanoutBuffer<B: Buffer> {
@@ -628,15 +627,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
-    fn from_planes(primary_plane: plane::Handle, planes: &Planes) -> Self {
+    fn from_planes(primary_plane: plane::Handle, planes: &Planes, include_cursor_planes: bool) -> Self {
         let mut tmp = SmallVec::with_capacity(planes.overlay.len() + planes.cursor.len() + 1);
         tmp.push((primary_plane, PlaneState::default()));
-        tmp.extend(
-            planes
-                .cursor
-                .iter()
-                .map(|info| (info.handle, PlaneState::default())),
-        );
+        if include_cursor_planes {
+            tmp.extend(
+                planes
+                    .cursor
+                    .iter()
+                    .map(|info| (info.handle, PlaneState::default())),
+            );
+        }
         tmp.extend(
             planes
                 .overlay
@@ -645,6 +646,14 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         );
 
         FrameState { planes: tmp }
+    }
+
+    fn add_cursor_planes(&mut self, planes: &Planes) {
+        for info in &planes.cursor {
+            if self.plane_state(info.handle).is_none() {
+                self.planes.push((info.handle, PlaneState::default()));
+            }
+        }
     }
 }
 
@@ -850,8 +859,193 @@ struct CursorState<G: AsFd + 'static> {
     framebuffer_exporter: GbmFramebufferExporter<G>,
     previous_output_transform: Option<Transform>,
     previous_output_scale: Option<Scale<f64>>,
+    legacy: LegacyCursorState,
     #[cfg(feature = "renderer_pixman")]
     pixman_renderer: Option<PixmanRenderer>,
+}
+
+/// Capability token for moving one installed legacy cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LegacyCursorToken(u64);
+
+/// Identity and placement of a cursor presented through legacy DRM ioctls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCursorPresentation {
+    /// Token accepted by [`DrmCompositor::move_legacy_cursor`].
+    pub token: LegacyCursorToken,
+    /// Current physical cursor-plane origin.
+    pub physical_origin: Point<i32, Physical>,
+    /// Render element presented by the cursor plane.
+    pub element_id: Id,
+    /// Commit presented by the cursor plane.
+    pub commit: CommitCounter,
+}
+
+/// Result of a cursor-only legacy DRM move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCursorMoveResult {
+    /// The cursor moved and this is its updated presentation identity.
+    Moved(LegacyCursorPresentation),
+    /// The token belongs to an earlier cursor installation.
+    StaleToken,
+    /// No legacy cursor is currently installed.
+    NotActive,
+    /// The driver permanently rejected cursor-only legacy moves.
+    Rejected,
+}
+
+#[derive(Debug)]
+enum LegacyCursorOwnership {
+    Candidate,
+    Active(LegacyCursorActive),
+    Disabled,
+    Atomic,
+}
+
+enum LegacyCursorAssignment {
+    Presented(LegacyCursorPresentation),
+    Software,
+    Atomic,
+}
+
+trait LegacyCursorIo<B> {
+    fn disable(&self) -> std::io::Result<()>;
+    fn install(&self, buffer: &B) -> std::io::Result<()>;
+    fn move_to(&self, origin: Point<i32, Physical>) -> std::io::Result<()>;
+}
+
+struct SurfaceLegacyCursorIo<'a>(&'a DrmSurface);
+
+#[allow(deprecated)]
+impl<B: drm::buffer::Buffer> LegacyCursorIo<B> for SurfaceLegacyCursorIo<'_> {
+    fn disable(&self) -> std::io::Result<()> {
+        self.0
+            .device_fd()
+            .set_cursor2::<B>(self.0.crtc(), None, (0, 0))
+    }
+
+    fn install(&self, buffer: &B) -> std::io::Result<()> {
+        self.0
+            .device_fd()
+            .set_cursor2(self.0.crtc(), Some(buffer), (0, 0))
+    }
+
+    fn move_to(&self, origin: Point<i32, Physical>) -> std::io::Result<()> {
+        self.0.device_fd().move_cursor(self.0.crtc(), origin.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyCursorInstallResult {
+    Installed,
+    PreserveActive,
+    DisabledSoftware,
+    CandidateSoftware,
+    Atomic,
+}
+
+fn install_legacy_cursor<B>(
+    io: &impl LegacyCursorIo<B>,
+    buffer: &B,
+    origin: Point<i32, Physical>,
+    replacing_active: bool,
+    legacy_succeeded: bool,
+) -> LegacyCursorInstallResult {
+    if replacing_active && io.disable().is_err() {
+        return LegacyCursorInstallResult::PreserveActive;
+    }
+    if legacy_succeeded && io.move_to(origin).is_err() {
+        return LegacyCursorInstallResult::DisabledSoftware;
+    }
+    if let Err(error) = io.install(buffer) {
+        return if !legacy_succeeded && classify_legacy_cursor_error(&error) == LegacyCursorIoError::Permanent {
+            LegacyCursorInstallResult::Atomic
+        } else if legacy_succeeded {
+            LegacyCursorInstallResult::DisabledSoftware
+        } else {
+            LegacyCursorInstallResult::CandidateSoftware
+        };
+    }
+    if !legacy_succeeded && io.move_to(origin).is_err() {
+        let _ = io.disable();
+        return LegacyCursorInstallResult::DisabledSoftware;
+    }
+    LegacyCursorInstallResult::Installed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyCursorIoError {
+    Permanent,
+    Inactive,
+    Busy,
+}
+
+fn classify_legacy_cursor_error(error: &std::io::Error) -> LegacyCursorIoError {
+    match error.raw_os_error() {
+        Some(22 | 25 | 38 | 95) => LegacyCursorIoError::Permanent,
+        Some(1 | 13) => LegacyCursorIoError::Inactive,
+        _ => LegacyCursorIoError::Busy,
+    }
+}
+
+/// Calculate the physical cursor-plane origin used by both atomic and legacy cursor paths.
+pub fn cursor_plane_location(
+    element_location: Point<i32, Physical>,
+    cursor_plane_size: Size<i32, Physical>,
+    output_geometry: Rectangle<i32, Physical>,
+    output_transform: Transform,
+) -> Point<i32, Physical> {
+    output_transform.transform_point_in(element_location, &output_geometry.size)
+        - output_transform.transform_point_in(Point::default(), &cursor_plane_size)
+}
+
+#[derive(Debug)]
+struct LegacyCursorActive {
+    _buffer: Arc<GbmBuffer>,
+    presentation: LegacyCursorPresentation,
+    element_size: Size<i32, Physical>,
+    output_scale: Scale<f64>,
+    output_transform: Transform,
+}
+
+#[derive(Debug)]
+struct LegacyCursorState {
+    ownership: LegacyCursorOwnership,
+    next_token: u64,
+    legacy_succeeded: bool,
+    fast_motion_permanently_rejected: bool,
+}
+
+impl LegacyCursorState {
+    fn new(policy: CursorPlanePolicy) -> Self {
+        Self {
+            ownership: if policy.reserves_legacy_cursor() {
+                LegacyCursorOwnership::Candidate
+            } else {
+                LegacyCursorOwnership::Atomic
+            },
+            next_token: 1,
+            legacy_succeeded: false,
+            fast_motion_permanently_rejected: false,
+        }
+    }
+
+    fn invalidate(&mut self, policy: CursorPlanePolicy) {
+        self.ownership = if policy.reserves_legacy_cursor() {
+            LegacyCursorOwnership::Candidate
+        } else {
+            LegacyCursorOwnership::Atomic
+        };
+        self.legacy_succeeded = false;
+        self.fast_motion_permanently_rejected = false;
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+    }
+
+    fn token(&mut self) -> LegacyCursorToken {
+        let token = LegacyCursorToken(self.next_token);
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+        token
+    }
 }
 
 #[derive(Debug, thiserror::Error, Copy, Clone)]
@@ -1039,10 +1233,12 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Allow to realize a cursor element through legacy cursor ioctls.
+        const ALLOW_LEGACY_CURSOR = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
-        const DEFAULT = Self::ALLOW_SCANOUT.bits();
+        const DEFAULT = Self::ALLOW_SCANOUT.bits() | Self::ALLOW_LEGACY_CURSOR.bits();
     }
 }
 
@@ -1082,6 +1278,7 @@ where
 
     cursor_size: Size<i32, Physical>,
     cursor_state: Option<CursorState<G>>,
+    cursor_plane_policy: CursorPlanePolicy,
 
     element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
     previous_element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
@@ -1146,6 +1343,53 @@ where
             .as_ref()
             .map(|frame| frame.presentation_mode)
             .unwrap_or(PresentationMode::Vsync)
+    }
+
+    /// Invalidate tokens and retained cursor buffers across a DRM lifecycle boundary.
+    pub fn invalidate_legacy_cursor_lifecycle(&mut self) {
+        if let Some(cursor_state) = self.cursor_state.as_mut() {
+            cursor_state.legacy.invalidate(self.cursor_plane_policy);
+        }
+    }
+
+    /// Move an active legacy cursor without submitting an atomic frame.
+    #[allow(deprecated)]
+    pub fn move_legacy_cursor(
+        &mut self,
+        token: LegacyCursorToken,
+        physical_origin: Point<i32, Physical>,
+    ) -> LegacyCursorMoveResult {
+        let Some(cursor_state) = self.cursor_state.as_mut() else {
+            return LegacyCursorMoveResult::NotActive;
+        };
+        if cursor_state.legacy.fast_motion_permanently_rejected {
+            return LegacyCursorMoveResult::Rejected;
+        }
+        let LegacyCursorOwnership::Active(active) = &mut cursor_state.legacy.ownership else {
+            return LegacyCursorMoveResult::NotActive;
+        };
+        if active.presentation.token != token {
+            return LegacyCursorMoveResult::StaleToken;
+        }
+
+        match self
+            .surface
+            .device_fd()
+            .move_cursor(self.surface.crtc(), physical_origin.into())
+        {
+            Ok(()) => {
+                active.presentation.physical_origin = physical_origin;
+                LegacyCursorMoveResult::Moved(active.presentation.clone())
+            }
+            Err(error) => {
+                if classify_legacy_cursor_error(&error) == LegacyCursorIoError::Permanent {
+                    cursor_state.legacy.fast_motion_permanently_rejected = true;
+                    LegacyCursorMoveResult::Rejected
+                } else {
+                    LegacyCursorMoveResult::NotActive
+                }
+            }
+        }
     }
 }
 
@@ -1282,12 +1526,41 @@ where
         output_mode_source: impl Into<OutputModeSource> + Debug,
         surface: DrmSurface,
         planes: Option<Planes>,
+        allocator: A,
+        framebuffer_exporter: F,
+        color_formats: impl IntoIterator<Item = DrmFourcc>,
+        renderer_formats: impl IntoIterator<Item = DrmFormat>,
+        cursor_size: Size<u32, BufferCoords>,
+        gbm: Option<GbmDevice<G>>,
+    ) -> FrameResult<Self, A, F> {
+        Self::new_with_cursor_plane_policy(
+            output_mode_source,
+            surface,
+            planes,
+            allocator,
+            framebuffer_exporter,
+            color_formats,
+            renderer_formats,
+            cursor_size,
+            gbm,
+            CursorPlanePolicy::Atomic,
+        )
+    }
+
+    /// Initialize a new compositor with an explicit cursor-plane ownership policy.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub fn new_with_cursor_plane_policy(
+        output_mode_source: impl Into<OutputModeSource> + Debug,
+        surface: DrmSurface,
+        planes: Option<Planes>,
         mut allocator: A,
         framebuffer_exporter: F,
         color_formats: impl IntoIterator<Item = DrmFourcc>,
         renderer_formats: impl IntoIterator<Item = DrmFormat>,
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
+        cursor_plane_policy: CursorPlanePolicy,
     ) -> FrameResult<Self, A, F> {
         let signaled_fence = match surface.create_syncobj(true) {
             Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
@@ -1373,6 +1646,7 @@ where
                 surface.clone(),
                 supports_fencing,
                 &planes,
+                !cursor_plane_policy.reserves_legacy_cursor(),
                 allocator,
                 &framebuffer_exporter,
                 renderer_formats.clone(),
@@ -1397,13 +1671,18 @@ where
                             framebuffer_exporter,
                             previous_output_scale: None,
                             previous_output_transform: None,
+                            legacy: LegacyCursorState::new(cursor_plane_policy),
                             #[cfg(feature = "renderer_pixman")]
                             pixman_renderer,
                         }
                     });
 
                     let overlay_plane_element_ids = OverlayPlaneElementIds::from_planes(&planes);
-                    let current_frame = FrameState::from_planes(surface.plane(), &planes);
+                    let current_frame = FrameState::from_planes(
+                        surface.plane(),
+                        &planes,
+                        !cursor_plane_policy.reserves_legacy_cursor(),
+                    );
 
                     let drm_renderer = DrmCompositor {
                         primary_plane_element_id: Id::new(),
@@ -1420,6 +1699,7 @@ where
                         framebuffer_exporter,
                         cursor_size,
                         cursor_state,
+                        cursor_plane_policy,
                         surface,
                         damage_tracker,
                         output_mode_source,
@@ -1475,6 +1755,34 @@ where
         modifiers: impl IntoIterator<Item = DrmModifier>,
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
+    ) -> FrameResult<Self, A, F> {
+        Self::with_format_and_cursor_plane_policy(
+            output_mode_source,
+            surface,
+            planes,
+            allocator,
+            framebuffer_exporter,
+            code,
+            modifiers,
+            cursor_size,
+            gbm,
+            CursorPlanePolicy::Atomic,
+        )
+    }
+
+    /// Initialize a compositor with a fixed format and cursor-plane policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_format_and_cursor_plane_policy(
+        output_mode_source: impl Into<OutputModeSource> + Debug,
+        surface: DrmSurface,
+        planes: Option<Planes>,
+        allocator: A,
+        framebuffer_exporter: F,
+        code: DrmFourcc,
+        modifiers: impl IntoIterator<Item = DrmModifier>,
+        cursor_size: Size<u32, BufferCoords>,
+        gbm: Option<GbmDevice<G>>,
+        cursor_plane_policy: CursorPlanePolicy,
     ) -> FrameResult<Self, A, F> {
         let signaled_fence = match surface.create_syncobj(true) {
             Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
@@ -1556,6 +1864,7 @@ where
             &surface,
             supports_fencing,
             &planes,
+            !cursor_plane_policy.reserves_legacy_cursor(),
             allocator,
             &framebuffer_exporter,
             code,
@@ -1581,13 +1890,18 @@ where
                 framebuffer_exporter,
                 previous_output_scale: None,
                 previous_output_transform: None,
+                legacy: LegacyCursorState::new(cursor_plane_policy),
                 #[cfg(feature = "renderer_pixman")]
                 pixman_renderer,
             }
         });
 
         let overlay_plane_element_ids = OverlayPlaneElementIds::from_planes(&planes);
-        let current_frame = FrameState::from_planes(surface.plane(), &planes);
+        let current_frame = FrameState::from_planes(
+            surface.plane(),
+            &planes,
+            !cursor_plane_policy.reserves_legacy_cursor(),
+        );
 
         let drm_renderer = DrmCompositor {
             primary_plane_element_id: Id::new(),
@@ -1604,6 +1918,7 @@ where
             framebuffer_exporter,
             cursor_size,
             cursor_state,
+            cursor_plane_policy,
             surface,
             damage_tracker,
             output_mode_source,
@@ -1626,6 +1941,7 @@ where
         drm: &DrmSurface,
         supports_fencing: bool,
         planes: &Planes,
+        include_cursor_planes: bool,
         allocator: A,
         framebuffer_exporter: &F,
         code: DrmFourcc,
@@ -1707,7 +2023,7 @@ where
 
         let mode_size = Size::from((mode.size().0 as i32, mode.size().1 as i32));
 
-        let mut current_frame_state = FrameState::from_planes(drm.plane(), planes);
+        let mut current_frame_state = FrameState::from_planes(drm.plane(), planes, include_cursor_planes);
         let plane_claim = match drm.claim_plane(drm.plane()) {
             Some(claim) => claim,
             None => {
@@ -1755,6 +2071,7 @@ where
         drm: Arc<DrmSurface>,
         supports_fencing: bool,
         planes: &Planes,
+        include_cursor_planes: bool,
         allocator: A,
         framebuffer_exporter: &F,
         mut renderer_formats: Vec<DrmFormat>,
@@ -1834,6 +2151,7 @@ where
             &drm,
             supports_fencing,
             planes,
+            include_cursor_planes,
             allocator,
             framebuffer_exporter,
             code,
@@ -1954,7 +2272,11 @@ where
                 .unwrap_or(&self.current_frame);
 
             // This will create an empty frame state, all planes are skipped by default
-            let mut next_frame_state = FrameState::from_planes(self.surface.plane(), &self.planes);
+            let mut next_frame_state = FrameState::from_planes(
+                self.surface.plane(),
+                &self.planes,
+                !self.cursor_plane_policy.reserves_legacy_cursor(),
+            );
 
             // We want to set skip to false on all planes that previously had something assigned so that
             // they get cleared when they are not longer used
@@ -2142,6 +2464,7 @@ where
             IndexMap::with_capacity(self.planes.overlay.len());
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
+        let mut legacy_cursor: Option<LegacyCursorPresentation> = None;
 
         // DRIFT-1427: the framebuffer effects of this frame and the region each one
         // samples. `output_elements` is front-to-back, so everything after an entry
@@ -2159,6 +2482,28 @@ where
                 .map(|(element, geometry, ..)| (element.is_framebuffer_effect(), *geometry)),
         );
 
+        let legacy_cursor_candidates = output_elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (element, ..))| (element.kind() == Kind::Cursor).then_some(index))
+            .collect::<SmallVec<[_; 2]>>();
+        let legacy_cursor_index = if frame_flags.contains(FrameFlags::ALLOW_LEGACY_CURSOR)
+            && self.cursor_plane_policy.reserves_legacy_cursor()
+            && legacy_cursor_candidates.len() == 1
+        {
+            Some(legacy_cursor_candidates[0])
+        } else {
+            let retained = self.disable_legacy_cursor();
+            if let Some(presentation) = retained {
+                legacy_cursor = Some(presentation.clone());
+                output_elements
+                    .iter()
+                    .position(|(element, ..)| element.id() == &presentation.element_id)
+            } else {
+                None
+            }
+        };
+
         let output_elements_len = output_elements.len();
         for (index, (element, element_geometry, element_visible_area, element_is_opaque)) in
             output_elements.iter().enumerate()
@@ -2167,6 +2512,39 @@ where
             let element_geometry = *element_geometry;
             let remaining_elements = output_elements_len - index;
             let element_is_opaque = *element_is_opaque;
+
+            if legacy_cursor_index == Some(index) {
+                let assignment = if let Some(presentation) = legacy_cursor.as_ref() {
+                    LegacyCursorAssignment::Presented(presentation.clone())
+                } else {
+                    self.try_assign_legacy_cursor(
+                        renderer,
+                        *element,
+                        element_geometry,
+                        output_scale,
+                        output_transform,
+                        output_geometry,
+                    )
+                };
+                match assignment {
+                    LegacyCursorAssignment::Presented(presentation) => {
+                        render_element_states
+                            .states
+                            .entry(element_id.clone())
+                            .and_modify(|state| {
+                                state.presentation_state = RenderElementPresentationState::ZeroCopy;
+                                state.visible_area += element_visible_area;
+                            })
+                            .or_insert_with(|| RenderElementState::zero_copy(*element_visible_area));
+                        legacy_cursor = Some(presentation);
+                        continue;
+                    }
+                    LegacyCursorAssignment::Atomic => {
+                        next_frame_state.add_cursor_planes(&self.planes);
+                    }
+                    LegacyCursorAssignment::Software => {}
+                }
+            }
 
             // Check if we found our last item, we can try to do
             // direct scan-out on the primary plane
@@ -2591,6 +2969,7 @@ where
             primary_element: primary_plane_element,
             overlay_elements: overlay_plane_elements.into_values().collect(),
             cursor_element: cursor_plane_element,
+            legacy_cursor,
             states: render_element_states,
             primary_plane_element_id: self.primary_plane_element_id.clone(),
             supports_fencing: self.supports_fencing,
@@ -2838,6 +3217,8 @@ where
 
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
+        self.disable_legacy_cursor();
+        self.invalidate_legacy_cursor_lifecycle();
         self.swapchain.reset_buffers();
     }
 
@@ -2927,6 +3308,8 @@ where
     /// [`crtc`] or any of the
     /// pending [`connector`]s.
     pub fn use_mode(&mut self, mode: Mode) -> FrameResult<(), A, F> {
+        self.disable_legacy_cursor();
+        self.invalidate_legacy_cursor_lifecycle();
         self.surface.use_mode(mode).map_err(FrameError::DrmError)?;
         let (w, h) = mode.size();
         self.swapchain.resize(w as _, h as _);
@@ -2996,6 +3379,7 @@ where
             &self.surface,
             self.supports_fencing,
             &self.planes,
+            !self.cursor_plane_policy.reserves_legacy_cursor(),
             allocator,
             &self.framebuffer_exporter,
             code,
@@ -3016,8 +3400,174 @@ where
             return;
         }
 
+        self.disable_legacy_cursor();
         self.damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         self.output_mode_source = output_mode_source;
+        self.invalidate_legacy_cursor_lifecycle();
+    }
+
+    fn enable_atomic_cursor_planes(&mut self) {
+        self.cursor_plane_policy = CursorPlanePolicy::Atomic;
+        self.current_frame.add_cursor_planes(&self.planes);
+        if let Some(frame) = self.pending_frame.as_mut() {
+            frame.frame.add_cursor_planes(&self.planes);
+        }
+        if let Some(frame) = self.queued_frame.as_mut() {
+            frame.prepared_frame.frame.add_cursor_planes(&self.planes);
+        }
+        if let Some(frame) = self.next_frame.as_mut() {
+            frame.frame.add_cursor_planes(&self.planes);
+        }
+    }
+
+    #[allow(deprecated)]
+    fn disable_legacy_cursor(&mut self) -> Option<LegacyCursorPresentation> {
+        let active = match self.cursor_state.as_ref().map(|state| &state.legacy.ownership) {
+            Some(LegacyCursorOwnership::Active(active)) => active.presentation.clone(),
+            _ => return None,
+        };
+        match self
+            .surface
+            .device_fd()
+            .set_cursor2::<GbmBuffer>(self.surface.crtc(), None, (0, 0))
+        {
+            Ok(()) => {
+                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Disabled;
+                None
+            }
+            Err(error) => {
+                debug!(?error, "failed to disable legacy cursor");
+                Some(active)
+            }
+        }
+    }
+
+    #[allow(deprecated)]
+    fn try_assign_legacy_cursor<R, E>(
+        &mut self,
+        renderer: &mut R,
+        element: &E,
+        element_geometry: Rectangle<i32, Physical>,
+        output_scale: Scale<f64>,
+        output_transform: Transform,
+        output_geometry: Rectangle<i32, Physical>,
+    ) -> LegacyCursorAssignment
+    where
+        R: Renderer,
+        E: RenderElement<R>,
+    {
+        let element_size = output_transform.transform_size(element_geometry.size);
+        if element_size.w > self.cursor_size.w || element_size.h > self.cursor_size.h {
+            return LegacyCursorAssignment::Software;
+        }
+        let physical_origin = cursor_plane_location(
+            element.location(output_scale),
+            self.cursor_size,
+            output_geometry,
+            output_transform,
+        );
+
+        let Some(cursor_state) = self.cursor_state.as_ref() else {
+            return LegacyCursorAssignment::Software;
+        };
+        if matches!(cursor_state.legacy.ownership, LegacyCursorOwnership::Atomic) {
+            return LegacyCursorAssignment::Atomic;
+        }
+
+        let unchanged = match &cursor_state.legacy.ownership {
+            LegacyCursorOwnership::Active(active) => {
+                active.presentation.element_id == *element.id()
+                    && active.presentation.commit == element.current_commit()
+                    && active.element_size == element_size
+                    && active.output_scale == output_scale
+                    && active.output_transform == output_transform
+            }
+            _ => false,
+        };
+        if unchanged {
+            let active = match &self.cursor_state.as_ref().unwrap().legacy.ownership {
+                LegacyCursorOwnership::Active(active) => active,
+                _ => unreachable!(),
+            };
+            if active.presentation.physical_origin == physical_origin {
+                return LegacyCursorAssignment::Presented(active.presentation.clone());
+            }
+            let token = active.presentation.token;
+            if let LegacyCursorMoveResult::Moved(presentation) =
+                self.move_legacy_cursor(token, physical_origin)
+            {
+                return LegacyCursorAssignment::Presented(presentation);
+            }
+        }
+
+        let replacing_active = matches!(
+            self.cursor_state.as_ref().unwrap().legacy.ownership,
+            LegacyCursorOwnership::Active(_)
+        );
+        let cursor_buffer = {
+            let cursor_state = self.cursor_state.as_mut().unwrap();
+            render_legacy_cursor_buffer(
+                cursor_state,
+                renderer,
+                element,
+                element_geometry,
+                self.cursor_size,
+                output_transform,
+            )
+        };
+        let Some(cursor_buffer) = cursor_buffer else {
+            return LegacyCursorAssignment::Software;
+        };
+
+        let legacy_succeeded = self.cursor_state.as_ref().unwrap().legacy.legacy_succeeded;
+        match install_legacy_cursor(
+            &SurfaceLegacyCursorIo(&self.surface),
+            &cursor_buffer,
+            physical_origin,
+            replacing_active,
+            legacy_succeeded,
+        ) {
+            LegacyCursorInstallResult::Installed => {}
+            LegacyCursorInstallResult::PreserveActive => {
+                let active = match &self.cursor_state.as_ref().unwrap().legacy.ownership {
+                    LegacyCursorOwnership::Active(active) => active,
+                    _ => unreachable!(),
+                };
+                return LegacyCursorAssignment::Presented(active.presentation.clone());
+            }
+            LegacyCursorInstallResult::DisabledSoftware => {
+                let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
+                legacy.legacy_succeeded = true;
+                legacy.ownership = LegacyCursorOwnership::Disabled;
+                return LegacyCursorAssignment::Software;
+            }
+            LegacyCursorInstallResult::CandidateSoftware => {
+                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Candidate;
+                return LegacyCursorAssignment::Software;
+            }
+            LegacyCursorInstallResult::Atomic => {
+                self.cursor_state.as_mut().unwrap().legacy.ownership = LegacyCursorOwnership::Atomic;
+                self.enable_atomic_cursor_planes();
+                return LegacyCursorAssignment::Atomic;
+            }
+        }
+
+        let cursor_state = self.cursor_state.as_mut().unwrap();
+        cursor_state.legacy.legacy_succeeded = true;
+        let presentation = LegacyCursorPresentation {
+            token: cursor_state.legacy.token(),
+            physical_origin,
+            element_id: element.id().clone(),
+            commit: element.current_commit(),
+        };
+        cursor_state.legacy.ownership = LegacyCursorOwnership::Active(LegacyCursorActive {
+            _buffer: Arc::new(cursor_buffer),
+            presentation: presentation.clone(),
+            element_size,
+            output_scale,
+            output_transform,
+        });
+        LegacyCursorAssignment::Presented(presentation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3254,6 +3804,9 @@ where
         R: Renderer,
         E: RenderElement<R>,
     {
+        if self.cursor_plane_policy.reserves_legacy_cursor() {
+            return None;
+        }
         if !frame_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT) {
             return None;
         }
@@ -3352,9 +3905,12 @@ where
 
         // this calculates the location of the cursor plane taking the simulated transform
         // into consideration
-        let cursor_plane_location = output_transform
-            .transform_point_in(element.location(scale), &output_geometry.size)
-            - output_transform.transform_point_in(Point::default(), &cursor_plane_size);
+        let cursor_plane_location = cursor_plane_location(
+            element.location(scale),
+            cursor_plane_size,
+            output_geometry,
+            output_transform,
+        );
 
         let previous_state = self
             .pending_frame
@@ -4302,6 +4858,8 @@ where
     ///
     /// Calling [`queue_frame`][Self::queue_frame] will re-enable.
     pub fn clear(&mut self) -> Result<(), DrmError> {
+        self.disable_legacy_cursor();
+        self.invalidate_legacy_cursor_lifecycle();
         self.surface.clear()?;
 
         self.current_frame
@@ -4409,6 +4967,117 @@ fn apply_output_transform(transform: Transform, output_transform: Transform) -> 
         (Transform::Flipped270, Transform::Flipped90) => Transform::_180,
         (Transform::Flipped270, Transform::Flipped180) => Transform::_270,
         (Transform::Flipped270, Transform::Flipped270) => Transform::Normal,
+    }
+}
+
+fn render_legacy_cursor_buffer<R, E, G>(
+    cursor_state: &mut CursorState<G>,
+    renderer: &mut R,
+    element: &E,
+    element_geometry: Rectangle<i32, Physical>,
+    cursor_size: Size<i32, Physical>,
+    output_transform: Transform,
+) -> Option<GbmBuffer>
+where
+    R: Renderer,
+    E: RenderElement<R>,
+    G: AsFd + Clone,
+{
+    let element_size = output_transform.transform_size(element_geometry.size);
+    let mut cursor_buffer = cursor_state
+        .allocator
+        .create_buffer(
+            cursor_size.w as u32,
+            cursor_size.h as u32,
+            DrmFourcc::Argb8888,
+            &[DrmModifier::Linear],
+        )
+        .ok()?;
+
+    if copy_element_to_cursor_bo(
+        renderer,
+        element,
+        element_size,
+        cursor_size,
+        output_transform,
+        &mut cursor_buffer,
+    ) {
+        return Some(cursor_buffer);
+    }
+
+    #[cfg(not(feature = "renderer_pixman"))]
+    return None;
+
+    #[cfg(feature = "renderer_pixman")]
+    {
+        let storage = element.underlying_storage(renderer)?;
+        let pixman_renderer = cursor_state.pixman_renderer.as_mut()?;
+        let cursor_texture = match storage {
+            UnderlyingStorage::Wayland(buffer) => pixman_renderer
+                .import_buffer(buffer, None, &[element.src().to_i32_up()])
+                .transpose()
+                .ok()
+                .flatten(),
+            UnderlyingStorage::Memory(memory) => {
+                let format = memory.format();
+                let size = memory.size();
+                let pixman_format = pixman::FormatCode::try_from(format).ok()?;
+                unsafe {
+                    pixman::Image::from_raw_mut(
+                        pixman_format,
+                        size.w as usize,
+                        size.h as usize,
+                        memory.as_ptr() as *mut u32,
+                        memory.stride() as usize,
+                        false,
+                    )
+                    .ok()
+                    .map(PixmanTexture::from)
+                }
+            }
+        }?;
+
+        let cursor_buffer_size = cursor_size.to_logical(1).to_buffer(1, Transform::Normal);
+        let ret = cursor_buffer
+            .map_mut::<_, Result<_, PixmanError>>(
+                0,
+                0,
+                cursor_buffer_size.w as u32,
+                cursor_buffer_size.h as u32,
+                |mbo| {
+                    let plane_pixman_format = pixman::FormatCode::try_from(DrmFourcc::Argb8888).unwrap();
+                    let mut cursor_dst = unsafe {
+                        pixman::Image::from_raw_mut(
+                            plane_pixman_format,
+                            mbo.width() as usize,
+                            mbo.height() as usize,
+                            mbo.buffer_mut().as_mut_ptr() as *mut u32,
+                            mbo.stride() as usize,
+                            false,
+                        )
+                    }
+                    .map_err(|_| PixmanError::ImportFailed)?;
+                    let mut framebuffer = pixman_renderer.bind(&mut cursor_dst)?;
+                    let mut frame = pixman_renderer.render(&mut framebuffer, cursor_size, output_transform)?;
+                    frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(cursor_size)])?;
+                    let src = element.src();
+                    let dst = Rectangle::from_size(element_geometry.size);
+                    frame.render_texture_from_to(
+                        &cursor_texture,
+                        src,
+                        dst,
+                        &[dst],
+                        &[],
+                        element.transform(),
+                        element.alpha(),
+                    )?;
+                    let _ = frame.finish()?.wait();
+                    Ok(())
+                },
+            )
+            .ok()?;
+        ret.ok()?;
+        Some(cursor_buffer)
     }
 }
 
@@ -4661,6 +5330,138 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[cfg(test)]
+mod legacy_cursor_tests {
+    use std::cell::RefCell;
+
+    use super::{
+        FrameFlags, LegacyCursorInstallResult, LegacyCursorIo, cursor_plane_location,
+        install_legacy_cursor,
+    };
+    use crate::utils::{Physical, Point, Rectangle, Size, Transform};
+
+    #[derive(Default)]
+    struct MockIo {
+        calls: RefCell<Vec<&'static str>>,
+        disable_error: Option<i32>,
+        install_error: Option<i32>,
+        move_error: Option<i32>,
+    }
+
+    impl LegacyCursorIo<()> for MockIo {
+        fn disable(&self) -> std::io::Result<()> {
+            self.calls.borrow_mut().push("disable");
+            self.disable_error
+                .map(std::io::Error::from_raw_os_error)
+                .map_or(Ok(()), Err)
+        }
+
+        fn install(&self, _buffer: &()) -> std::io::Result<()> {
+            self.calls.borrow_mut().push("install");
+            self.install_error
+                .map(std::io::Error::from_raw_os_error)
+                .map_or(Ok(()), Err)
+        }
+
+        fn move_to(&self, _origin: Point<i32, Physical>) -> std::io::Result<()> {
+            self.calls.borrow_mut().push("move");
+            self.move_error
+                .map(std::io::Error::from_raw_os_error)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    fn install(io: &MockIo, replacing: bool, succeeded: bool) -> LegacyCursorInstallResult {
+        install_legacy_cursor(io, &(), Point::from((10, 20)), replacing, succeeded)
+    }
+
+    #[test]
+    fn first_install_sets_then_places() {
+        let io = MockIo::default();
+        assert_eq!(install(&io, false, false), LegacyCursorInstallResult::Installed);
+        assert_eq!(&*io.calls.borrow(), &["install", "move"]);
+    }
+
+    #[test]
+    fn replacement_disables_moves_then_installs() {
+        let io = MockIo::default();
+        assert_eq!(install(&io, true, true), LegacyCursorInstallResult::Installed);
+        assert_eq!(&*io.calls.borrow(), &["disable", "move", "install"]);
+    }
+
+    #[test]
+    fn failed_disable_preserves_the_active_cursor() {
+        let io = MockIo {
+            disable_error: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            install(&io, true, true),
+            LegacyCursorInstallResult::PreserveActive
+        );
+        assert_eq!(&*io.calls.borrow(), &["disable"]);
+    }
+
+    #[test]
+    fn only_a_permanent_first_install_releases_the_plane_to_atomic() {
+        let permanent = MockIo {
+            install_error: Some(22),
+            ..Default::default()
+        };
+        assert_eq!(
+            install(&permanent, false, false),
+            LegacyCursorInstallResult::Atomic
+        );
+
+        let transient = MockIo {
+            install_error: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            install(&transient, false, false),
+            LegacyCursorInstallResult::CandidateSoftware
+        );
+
+        let after_success = MockIo {
+            install_error: Some(22),
+            ..Default::default()
+        };
+        assert_eq!(
+            install(&after_success, false, true),
+            LegacyCursorInstallResult::DisabledSoftware
+        );
+    }
+
+    #[test]
+    fn failed_initial_placement_cleans_up_the_installed_cursor() {
+        let io = MockIo {
+            move_error: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            install(&io, false, false),
+            LegacyCursorInstallResult::DisabledSoftware
+        );
+        assert_eq!(&*io.calls.borrow(), &["install", "move", "disable"]);
+    }
+
+    #[test]
+    fn placement_and_default_flags_share_the_legacy_contract() {
+        let output = Rectangle::from_size(Size::from((100, 80)));
+        assert_eq!(
+            cursor_plane_location(
+                Point::from((12, 7)),
+                Size::from((64, 64)),
+                output,
+                Transform::Normal,
+            ),
+            Point::from((12, 7)),
+        );
+        assert!(FrameFlags::DEFAULT.contains(FrameFlags::ALLOW_LEGACY_CURSOR));
+        assert!(!FrameFlags::empty().contains(FrameFlags::ALLOW_LEGACY_CURSOR));
+    }
 }
 
 /// DRIFT-1427. An element below a framebuffer effect it overlaps must be composited

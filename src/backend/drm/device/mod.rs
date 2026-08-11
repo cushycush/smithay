@@ -24,6 +24,26 @@ use legacy::LegacyDrmDevice;
 
 use tracing::{debug_span, error, info, instrument, trace};
 
+/// Selects who owns cursor planes on an atomic DRM device.
+///
+/// The default keeps cursor planes in Smithay's atomic requests. Reserving them
+/// leaves their properties untouched so a compositor can use the legacy cursor
+/// ioctls without mixing the two KMS interfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CursorPlanePolicy {
+    /// Cursor planes are managed through atomic KMS.
+    #[default]
+    Atomic,
+    /// Cursor planes are excluded from device-wide atomic state.
+    ReserveForLegacy,
+}
+
+impl CursorPlanePolicy {
+    pub(crate) fn reserves_legacy_cursor(self) -> bool {
+        matches!(self, Self::ReserveForLegacy)
+    }
+}
+
 #[derive(Debug)]
 struct PlaneClaimInner {
     plane: drm::control::plane::Handle,
@@ -113,6 +133,7 @@ pub struct DrmDevice {
     resources: ResourceHandles,
     plane_claim_storage: PlaneClaimStorage,
     surfaces: Vec<Weak<DrmSurfaceInternal>>,
+    cursor_plane_policy: CursorPlanePolicy,
 }
 
 impl AsFd for DrmDevice {
@@ -179,6 +200,15 @@ impl DrmDevice {
     ///
     /// Returns an error if the file is no valid drm node or the device is not accessible.
     pub fn new(fd: DrmDeviceFd, disable_connectors: bool) -> Result<(Self, DrmDeviceNotifier), Error> {
+        Self::new_with_cursor_plane_policy(fd, disable_connectors, CursorPlanePolicy::Atomic)
+    }
+
+    /// Create a new [`DrmDevice`] with an explicit cursor-plane ownership policy.
+    pub fn new_with_cursor_plane_policy(
+        fd: DrmDeviceFd,
+        disable_connectors: bool,
+        cursor_plane_policy: CursorPlanePolicy,
+    ) -> Result<(Self, DrmDeviceNotifier), Error> {
         // setup parent span for internal device types
         let span = debug_span!(
             "drm_device",
@@ -213,7 +243,12 @@ impl DrmDevice {
             })
         })?;
 
-        let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+        let internal = Arc::new(DrmDevice::create_internal(
+            fd,
+            active,
+            disable_connectors,
+            cursor_plane_policy,
+        )?);
 
         Ok((
             DrmDevice {
@@ -224,6 +259,7 @@ impl DrmDevice {
                 resources,
                 plane_claim_storage: Default::default(),
                 surfaces: Default::default(),
+                cursor_plane_policy,
             },
             DrmDeviceNotifier {
                 internal,
@@ -237,6 +273,7 @@ impl DrmDevice {
         fd: DrmDeviceFd,
         active: Arc<AtomicBool>,
         disable_connectors: bool,
+        cursor_plane_policy: CursorPlanePolicy,
     ) -> Result<DrmDeviceInternal, Error> {
         let force_legacy = std::env::var("SMITHAY_USE_LEGACY")
             .map(|x| {
@@ -250,7 +287,12 @@ impl DrmDevice {
 
         Ok(
             if !force_legacy && fd.set_client_capability(ClientCapability::Atomic, true).is_ok() {
-                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(fd, active, disable_connectors)?)
+                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(
+                    fd,
+                    active,
+                    disable_connectors,
+                    cursor_plane_policy,
+                )?)
             } else {
                 info!("Falling back to LegacyDrmDevice");
                 DrmDeviceInternal::Legacy(LegacyDrmDevice::new(fd, active, disable_connectors)?)
@@ -264,6 +306,11 @@ impl DrmDevice {
             DrmDeviceInternal::Atomic(_) => true,
             DrmDeviceInternal::Legacy(_) => false,
         }
+    }
+
+    /// The cursor-plane ownership policy selected at device construction.
+    pub fn cursor_plane_policy(&self) -> CursorPlanePolicy {
+        self.cursor_plane_policy
     }
 
     /// Returns a list of crtcs for this device

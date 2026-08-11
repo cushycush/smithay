@@ -879,6 +879,8 @@ pub struct LegacyCursorPresentation {
     pub element_id: Id,
     /// Commit presented by the cursor plane.
     pub commit: CommitCounter,
+    /// Buffer size installed on the legacy cursor plane.
+    pub plane_size: Size<i32, Physical>,
 }
 
 /// Result of a cursor-only legacy DRM move.
@@ -3559,6 +3561,7 @@ where
             physical_origin,
             element_id: element.id().clone(),
             commit: element.current_commit(),
+            plane_size: self.cursor_size,
         };
         cursor_state.legacy.ownership = LegacyCursorOwnership::Active(LegacyCursorActive {
             _buffer: Arc::new(cursor_buffer),

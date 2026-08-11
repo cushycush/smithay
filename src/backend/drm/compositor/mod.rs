@@ -1087,6 +1087,16 @@ impl LegacyCursorState {
         self.setup_failures = 0;
         self.setup_retry_exhausted = false;
     }
+
+    fn record_setup_result(&mut self, result: LegacyCursorInstallResult) {
+        match result {
+            LegacyCursorInstallResult::Installed => self.setup_succeeded(),
+            LegacyCursorInstallResult::PreserveActive
+            | LegacyCursorInstallResult::DisabledSoftware
+            | LegacyCursorInstallResult::CandidateSoftware => self.setup_failed(),
+            LegacyCursorInstallResult::Atomic => {}
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, Copy, Clone)]
@@ -3535,11 +3545,25 @@ where
         if matches!(cursor_state.legacy.ownership, LegacyCursorOwnership::Atomic) {
             return LegacyCursorAssignment::Atomic;
         }
-        if self.planes.cursor.is_empty() || cursor_state.legacy.setup_retry_exhausted {
+        if self.planes.cursor.is_empty() {
             let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
             legacy.ownership = LegacyCursorOwnership::Disabled;
             legacy.setup_retry_exhausted = true;
             return LegacyCursorAssignment::Software { changed: false };
+        }
+        if cursor_state.legacy.setup_retry_exhausted {
+            return match &cursor_state.legacy.ownership {
+                LegacyCursorOwnership::Active(active) => LegacyCursorAssignment::Presented {
+                    presentation: active.presentation.clone(),
+                    changed: false,
+                },
+                LegacyCursorOwnership::Candidate | LegacyCursorOwnership::Disabled => {
+                    self.cursor_state.as_mut().unwrap().legacy.ownership =
+                        LegacyCursorOwnership::Disabled;
+                    LegacyCursorAssignment::Software { changed: false }
+                }
+                LegacyCursorOwnership::Atomic => LegacyCursorAssignment::Atomic,
+            };
         }
 
         let unchanged = match &cursor_state.legacy.ownership {
@@ -3594,16 +3618,20 @@ where
         };
 
         let legacy_succeeded = self.cursor_state.as_ref().unwrap().legacy.legacy_succeeded;
-        match install_legacy_cursor(
+        let install_result = install_legacy_cursor(
             &SurfaceLegacyCursorIo(&self.surface),
             &cursor_buffer,
             physical_origin,
             replacing_active,
             legacy_succeeded,
-        ) {
-            LegacyCursorInstallResult::Installed => {
-                self.cursor_state.as_mut().unwrap().legacy.setup_succeeded();
-            }
+        );
+        self.cursor_state
+            .as_mut()
+            .unwrap()
+            .legacy
+            .record_setup_result(install_result);
+        match install_result {
+            LegacyCursorInstallResult::Installed => {}
             LegacyCursorInstallResult::PreserveActive => {
                 let active = match &self.cursor_state.as_ref().unwrap().legacy.ownership {
                     LegacyCursorOwnership::Active(active) => active,
@@ -3618,13 +3646,11 @@ where
                 let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
                 legacy.legacy_succeeded = true;
                 legacy.ownership = LegacyCursorOwnership::Disabled;
-                legacy.setup_failed();
                 return LegacyCursorAssignment::Software { changed: true };
             }
             LegacyCursorInstallResult::CandidateSoftware => {
                 let legacy = &mut self.cursor_state.as_mut().unwrap().legacy;
                 legacy.ownership = LegacyCursorOwnership::Candidate;
-                legacy.setup_failed();
                 if legacy.setup_retry_exhausted {
                     legacy.ownership = LegacyCursorOwnership::Disabled;
                 }
@@ -5582,6 +5608,25 @@ mod legacy_cursor_tests {
         legacy.invalidate(CursorPlanePolicy::ReserveForLegacy);
         assert!(!legacy.setup_retry_exhausted);
         assert_eq!(legacy.setup_failures, 0);
+    }
+
+    #[test]
+    fn failed_active_replacements_enter_the_setup_retry_budget() {
+        let io = MockIo {
+            disable_error: Some(16),
+            ..Default::default()
+        };
+        let mut legacy = LegacyCursorState::new(CursorPlanePolicy::ReserveForLegacy);
+        for _ in 0..MAX_LEGACY_CURSOR_SETUP_FAILURES {
+            let result = install(&io, true, true);
+            assert_eq!(result, LegacyCursorInstallResult::PreserveActive);
+            legacy.record_setup_result(result);
+        }
+        assert!(legacy.setup_retry_exhausted);
+        assert_eq!(
+            &*io.calls.borrow(),
+            &["disable", "disable", "disable"],
+        );
     }
 }
 

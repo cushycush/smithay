@@ -370,6 +370,61 @@ impl OutputDamageTracker {
         self.render_output_internal(renderer, framebuffer, &render_elements, clear_color, states)
     }
 
+    /// Render this output while treating caller states as sparse framebuffer-capture hints.
+    ///
+    /// Unlike [`Self::render_output_with_states`], the supplied states are input only. The
+    /// returned states are freshly computed for every element in this frame, so callers can add a
+    /// `needs_capture` hint without replacing presentation and visibility results.
+    ///
+    /// - `elements` for this output in front-to-back order
+    /// - `capture_hints` sparse states whose `needs_capture` fields may force framebuffer effects
+    #[instrument(
+        level = "trace",
+        parent = &self.span,
+        skip(renderer, framebuffer, elements, clear_color, capture_hints)
+    )]
+    #[profiling::function]
+    pub fn render_output_with_capture_hints<E, R>(
+        &mut self,
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        age: usize,
+        elements: &[E],
+        clear_color: impl Into<Color32F>,
+        capture_hints: &RenderElementStates,
+    ) -> Result<RenderOutputResult<'_>, Error<R::Error>>
+    where
+        E: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture,
+    {
+        let clear_color = clear_color.into();
+        let (output_size, output_scale, output_transform) =
+            std::convert::TryInto::<(Size<i32, Physical>, Scale<f64>, Transform)>::try_into(&self.mode)?;
+
+        let output_transform = output_transform.invert();
+        let output_geo = Rectangle::from_size(output_transform.transform_size(output_size));
+
+        let mut render_elements: Vec<&E> = Vec::with_capacity(elements.len());
+        let states = self.damage_output_internal(
+            age,
+            elements,
+            output_scale,
+            output_transform,
+            output_geo,
+            Some(clear_color),
+            &mut render_elements,
+            Some(capture_hints),
+        );
+
+        if self.damage.is_empty() {
+            trace!("no damage, skipping rendering");
+            return Ok(RenderOutputResult::skipped(states));
+        }
+
+        self.render_output_internal(renderer, framebuffer, &render_elements, clear_color, states)
+    }
+
     /// Render this output with the provided [`Renderer`] and provided states.
     ///
     /// Note: This is meant for cases, where rendering should happen with a different

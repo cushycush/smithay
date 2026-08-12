@@ -160,7 +160,7 @@ use crate::{
         drm::{CursorPlanePolicy, DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
             Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
-            damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
+            damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
                 RenderElementStates, RenderingReason, UnderlyingStorage,
@@ -186,6 +186,30 @@ mod frame_result;
 
 use elements::*;
 pub use frame_result::*;
+
+fn render_primary_plane_with_capture_hints<'d, E, R>(
+    damage_tracker: &'d mut OutputDamageTracker,
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'_>,
+    age: usize,
+    elements: &[E],
+    clear_color: Color32F,
+    capture_hints: &RenderElementStates,
+) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
+where
+    E: RenderElement<R>,
+    R: Renderer,
+    R::TextureId: Texture,
+{
+    damage_tracker.render_output_with_capture_hints(
+        renderer,
+        framebuffer,
+        age,
+        elements,
+        clear_color,
+        capture_hints,
+    )
+}
 
 impl RenderElementState {
     pub(crate) fn zero_copy(visible_area: usize) -> Self {
@@ -2261,6 +2285,34 @@ where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        self.render_frame_with_capture_hints(
+            renderer,
+            elements,
+            clear_color,
+            frame_flags,
+            &RenderElementStates::default(),
+        )
+    }
+
+    /// Render the next frame with sparse framebuffer-capture hints.
+    ///
+    /// The hints affect damage and capture decisions only. [`RenderFrameResult::states`] remains
+    /// the compositor's complete computed result for this frame.
+    #[instrument(level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_with_capture_hints<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+        capture_hints: &RenderElementStates,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
         let mut clear_color = clear_color.into();
 
         if !self.surface.is_active() {
@@ -2900,9 +2952,15 @@ where
             let mut framebuffer = renderer
                 .bind(&mut dmabuf)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
-            let render_res =
-                self.damage_tracker
-                    .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
+            let render_res = render_primary_plane_with_capture_hints(
+                &mut self.damage_tracker,
+                renderer,
+                &mut framebuffer,
+                age,
+                &elements,
+                clear_color,
+                capture_hints,
+            );
 
             // restore the renderer debug flags
             renderer.set_debug_flags(renderer_debug_flags);
@@ -5444,6 +5502,167 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[cfg(test)]
+mod capture_hint_tests {
+    use std::cell::Cell;
+
+    use super::render_primary_plane_with_capture_hints;
+    use crate::{
+        backend::renderer::{
+            Color32F,
+            damage::OutputDamageTracker,
+            element::{
+                Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
+                RenderElementStates,
+            },
+            test::{DummyError, DummyFramebuffer, DummyFrame, DummyRenderer},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
+        },
+        utils::{Buffer, Physical, Rectangle, Scale, Transform, user_data::UserDataMap},
+    };
+
+    #[derive(Debug)]
+    struct TestElement {
+        id: Id,
+        geometry: Rectangle<i32, Physical>,
+        opaque: bool,
+        effect: bool,
+        captures: Cell<u32>,
+    }
+
+    impl TestElement {
+        fn new(geometry: Rectangle<i32, Physical>, opaque: bool, effect: bool) -> Self {
+            Self {
+                id: Id::new(),
+                geometry,
+                opaque,
+                effect,
+                captures: Cell::new(0),
+            }
+        }
+    }
+
+    impl Element for TestElement {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+
+        fn current_commit(&self) -> CommitCounter {
+            CommitCounter::default()
+        }
+
+        fn src(&self) -> Rectangle<f64, Buffer> {
+            Rectangle::from_size((self.geometry.size.w as f64, self.geometry.size.h as f64).into())
+        }
+
+        fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            self.geometry
+        }
+
+        fn damage_since(
+            &self,
+            _scale: Scale<f64>,
+            _commit: Option<CommitCounter>,
+        ) -> DamageSet<i32, Physical> {
+            DamageSet::default()
+        }
+
+        fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+            if self.opaque {
+                OpaqueRegions::from_slice(&[Rectangle::from_size(self.geometry.size)])
+            } else {
+                OpaqueRegions::default()
+            }
+        }
+
+        fn kind(&self) -> Kind {
+            Kind::Unspecified
+        }
+
+        fn is_framebuffer_effect(&self) -> bool {
+            self.effect
+        }
+    }
+
+    impl RenderElement<DummyRenderer> for TestElement {
+        fn draw(
+            &self,
+            _frame: &mut DummyFrame,
+            _src: Rectangle<f64, Buffer>,
+            _dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _opaque_regions: &[Rectangle<i32, Physical>],
+            _cache: Option<&UserDataMap>,
+        ) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn capture_framebuffer(
+            &self,
+            _frame: &mut DummyFrame,
+            _src: Rectangle<f64, Buffer>,
+            _dst: Rectangle<i32, Physical>,
+            _cache: &UserDataMap,
+        ) -> Result<(), DummyError> {
+            self.captures.set(self.captures.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sparse_capture_hints_force_effect_damage_and_keep_computed_states() {
+        let occluder = TestElement::new(Rectangle::new((0, 0).into(), (100, 50).into()), true, false);
+        let effect = TestElement::new(Rectangle::new((25, 25).into(), (50, 50).into()), false, true);
+        let ordinary = TestElement::new(Rectangle::new((75, 75).into(), (20, 20).into()), false, false);
+        let elements = [occluder, effect, ordinary];
+        let mut renderer = DummyRenderer;
+        let mut framebuffer = DummyFramebuffer;
+        let mut tracker = OutputDamageTracker::new((100, 100), 1.0, Transform::Normal);
+
+        render_primary_plane_with_capture_hints(
+            &mut tracker,
+            &mut renderer,
+            &mut framebuffer,
+            0,
+            &elements,
+            Color32F::TRANSPARENT,
+            &RenderElementStates::default(),
+        )
+        .unwrap();
+        assert_eq!(elements[1].captures.get(), 1);
+
+        let mut hints = RenderElementStates::default();
+        hints.states.insert(
+            elements[1].id.clone(),
+            RenderElementState {
+                visible_area: 0,
+                presentation_state: RenderElementPresentationState::Skipped,
+                needs_capture: true,
+            },
+        );
+        let result = render_primary_plane_with_capture_hints(
+            &mut tracker,
+            &mut renderer,
+            &mut framebuffer,
+            1,
+            &elements,
+            Color32F::TRANSPARENT,
+            &hints,
+        )
+        .unwrap();
+
+        assert_eq!(elements[1].captures.get(), 2);
+        assert!(result.damage.is_some());
+        let ordinary_state = result.states.states.get(&elements[2].id).unwrap();
+        assert_eq!(ordinary_state.visible_area, 400);
+        assert!(matches!(
+            ordinary_state.presentation_state,
+            RenderElementPresentationState::Rendering { .. }
+        ));
+        assert!(!ordinary_state.needs_capture);
+    }
 }
 
 #[cfg(test)]

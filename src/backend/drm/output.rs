@@ -18,7 +18,10 @@ use crate::{
             dmabuf::{AsDmabuf, Dmabuf},
             gbm::GbmDevice,
         },
-        renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
+        renderer::{
+            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture,
+            element::{RenderElement, RenderElementStates},
+        },
     },
     output::OutputModeSource,
     utils::{Physical, Point},
@@ -722,6 +725,34 @@ where
     {
         self.with_compositor(|compositor| {
             compositor.render_frame(renderer, elements, clear_color, frame_mode)
+        })
+    }
+
+    /// Render the next frame with sparse framebuffer-capture hints.
+    ///
+    /// The returned element states remain the compositor's complete computed result.
+    pub fn render_frame_with_capture_hints<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_mode: FrameFlags,
+        capture_hints: &RenderElementStates,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        self.with_compositor(|compositor| {
+            compositor.render_frame_with_capture_hints(
+                renderer,
+                elements,
+                clear_color,
+                frame_mode,
+                capture_hints,
+            )
         })
     }
 
